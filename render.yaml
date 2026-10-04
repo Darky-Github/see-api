@@ -1,0 +1,21 @@
+services:
+  - type: web
+    runtime: node
+    name: see-api
+
+    plan: free
+
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_VERSION
+        value: 24.21.0
+
+      - key: SUPABASE_URL
+        sync: false
+
+      - key: SUPABASE_SECRET_KEY
+        sync: false
