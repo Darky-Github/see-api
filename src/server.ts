@@ -4,10 +4,6 @@ import { promisify } from "node:util"
 
 const gunzipAsync = promisify(gunzip)
 
-/* =========================================================
-   TYPES
-   ========================================================= */
-
 interface Env {
   SUPABASE_URL: string
   SUPABASE_SECRET_KEY: string
@@ -67,44 +63,22 @@ interface MediaItem {
   thumbnail_path?: string
 }
 
-/* =========================================================
-   CONFIGURATION
-   ========================================================= */
-
-/*
-  These are search-work limits, not Cloudflare
-  subrequest limits.
-
-  Render does not impose the Worker-style
-  per-request subrequest budget that the old
-  implementation was designed around.
-*/
-
 const MAX_DOCUMENT_IDS = 1000
-
 const MAX_SEARCH_RESULTS = 25
-
 const MAX_IMAGES_PER_RESULT = 4
-
 const MAX_VIDEOS_PER_RESULT = 2
-
 const MAX_IMAGE_SIGNED_URLS = 100
-
 const SIGNED_URL_EXPIRES = 3600
 
-/*
-  Safety limits for the larger Render instance.
-*/
-
 const MAX_TERM_SHARDS_PER_SEARCH = 128
-
 const MAX_DOCUMENT_SHARDS_PER_SEARCH = 128
-
 const MAX_TERM_ENTRY_DOCUMENTS = 1000
 
 const SEARCH_TIMEOUT_MS = 15000
+const MEDIA_TIMEOUT_MS = 4000
 
-const MEDIA_TIMEOUT_MS = 5000
+const TERM_SHARD_CONCURRENCY = 12
+const DOCUMENT_SHARD_CONCURRENCY = 12
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -113,10 +87,6 @@ const CORS_HEADERS = {
     "Content-Type, Authorization",
   "Access-Control-Max-Age": "86400"
 }
-
-/* =========================================================
-   ENVIRONMENT
-   ========================================================= */
 
 function loadEnv(): Env {
   const SUPABASE_URL =
@@ -138,14 +108,11 @@ function loadEnv(): Env {
   }
 
   return {
-    SUPABASE_URL: SUPABASE_URL.replace(/\/+$/, ""),
+    SUPABASE_URL:
+      SUPABASE_URL.replace(/\/+$/, ""),
     SUPABASE_SECRET_KEY
   }
 }
-
-/* =========================================================
-   REQUEST HELPERS
-   ========================================================= */
 
 function withTimeout(
   signal: AbortSignal | undefined,
@@ -175,34 +142,6 @@ async function fetchWithTimeout(
   })
 }
 
-/* =========================================================
-   CORS
-   ========================================================= */
-
-function applyCors(
-  response: Response
-): Response {
-  const headers = new Headers(
-    response.headers
-  )
-
-  for (
-    const [key, value]
-    of Object.entries(CORS_HEADERS)
-  ) {
-    headers.set(key, value)
-  }
-
-  return new Response(
-    response.body,
-    {
-      status: response.status,
-      statusText: response.statusText,
-      headers
-    }
-  )
-}
-
 function jsonResponse(
   data: unknown,
   status = 200
@@ -213,15 +152,12 @@ function jsonResponse(
       status,
       headers: {
         ...CORS_HEADERS,
-        "Content-Type": "application/json; charset=utf-8"
+        "Content-Type":
+          "application/json; charset=utf-8"
       }
     }
   )
 }
-
-/* =========================================================
-   SUPABASE STORAGE
-   ========================================================= */
 
 function storageUrl(
   env: Env,
@@ -240,27 +176,24 @@ function supabaseHeaders(
   return {
     Authorization:
       `Bearer ${env.SUPABASE_SECRET_KEY}`,
-
     apikey:
       env.SUPABASE_SECRET_KEY
   }
 }
 
-/* =========================================================
-   GZIP STORAGE
-   ========================================================= */
-
 async function fetchGzipText(
   env: Env,
   path: string,
-  timeoutMs = SEARCH_TIMEOUT_MS
+  timeoutMs = SEARCH_TIMEOUT_MS,
+  signal?: AbortSignal
 ): Promise<string> {
   const response =
     await fetchWithTimeout(
       storageUrl(env, path),
       {
         headers:
-          supabaseHeaders(env)
+          supabaseHeaders(env),
+        signal
       },
       timeoutMs
     )
@@ -283,12 +216,6 @@ async function fetchGzipText(
       await response.arrayBuffer()
     )
 
-  /*
-    Supabase Storage contains actual .gz files.
-    Decompress them explicitly on Node rather than
-    relying on Cloudflare's DecompressionStream.
-  */
-
   const decompressed =
     await gunzipAsync(bytes)
 
@@ -297,11 +224,19 @@ async function fetchGzipText(
 
 async function fetchJson(
   env: Env,
-  path: string
+  path: string,
+  timeoutMs = SEARCH_TIMEOUT_MS,
+  signal?: AbortSignal
 ): Promise<any> {
   const response =
     await fetchWithTimeout(
-      storageUrl(env, path)
+      storageUrl(env, path),
+      {
+        headers:
+          supabaseHeaders(env),
+        signal
+      },
+      timeoutMs
     )
 
   if (!response.ok) {
@@ -336,10 +271,14 @@ function parseJsonOrJsonl(
     const lines =
       trimmed
         .split(/\r?\n/)
-        .map(line => line.trim())
+        .map(
+          line =>
+            line.trim()
+        )
         .filter(Boolean)
 
-    const values: any[] = []
+    const values: any[] =
+      []
 
     for (
       let index = 0;
@@ -348,7 +287,9 @@ function parseJsonOrJsonl(
     ) {
       try {
         values.push(
-          JSON.parse(lines[index])
+          JSON.parse(
+            lines[index]
+          )
         )
       } catch (error) {
         throw new Error(
@@ -370,13 +311,15 @@ function parseJsonOrJsonl(
 async function fetchGzipJson(
   env: Env,
   path: string,
-  timeoutMs = SEARCH_TIMEOUT_MS
+  timeoutMs = SEARCH_TIMEOUT_MS,
+  signal?: AbortSignal
 ): Promise<any> {
   const text =
     await fetchGzipText(
       env,
       path,
-      timeoutMs
+      timeoutMs,
+      signal
     )
 
   return parseJsonOrJsonl(text)
@@ -394,10 +337,6 @@ function releasePath(
 
   return `${version}/${path}`
 }
-
-/* =========================================================
-   SIGNED URLS
-   ========================================================= */
 
 async function createSignedUrls(
   env: Env,
@@ -425,17 +364,14 @@ async function createSignedUrls(
       url,
       {
         method: "POST",
-
         headers: {
           ...supabaseHeaders(env),
           "Content-Type":
             "application/json"
         },
-
         body: JSON.stringify({
           expiresIn:
             SIGNED_URL_EXPIRES,
-
           paths:
             uniquePaths
         })
@@ -495,10 +431,6 @@ async function createSignedUrls(
 
   return result
 }
-
-/* =========================================================
-   TOKENIZATION
-   ========================================================= */
 
 function tokenize(
   query: string
@@ -570,10 +502,6 @@ function detectDictionaryQuery(
   }
 }
 
-/* =========================================================
-   DICTIONARY
-   ========================================================= */
-
 async function getDictionary(
   word: string
 ): Promise<any> {
@@ -600,22 +528,22 @@ async function getDictionary(
   return response.json()
 }
 
-/* =========================================================
-   RELEASE / MANIFEST
-   ========================================================= */
-
 async function loadCurrentRelease(
-  env: Env
+  env: Env,
+  signal?: AbortSignal
 ): Promise<CurrentRelease> {
   return fetchGzipJson(
     env,
-    "current.json"
+    "current.json",
+    SEARCH_TIMEOUT_MS,
+    signal
   )
 }
 
 async function loadManifest(
   env: Env,
-  current: CurrentRelease
+  current: CurrentRelease,
+  signal?: AbortSignal
 ): Promise<Manifest> {
   const manifestPath =
     releasePath(
@@ -625,23 +553,25 @@ async function loadManifest(
 
   return fetchGzipJson(
     env,
-    manifestPath
+    manifestPath,
+    SEARCH_TIMEOUT_MS,
+    signal
   )
 }
-
-/* =========================================================
-   TERM SHARDS
-   ========================================================= */
 
 function normalizeTermShard(
   data: any
 ): Map<string, TermEntry[]> {
   const result =
-    new Map<string, TermEntry[]>()
+    new Map<
+      string,
+      TermEntry[]
+    >()
 
   if (
     data &&
-    typeof data === "object" &&
+    typeof data ===
+      "object" &&
     !Array.isArray(data)
   ) {
     for (
@@ -660,14 +590,18 @@ function normalizeTermShard(
               entry =>
                 entry &&
                 typeof entry ===
-                  "object"
+                  "object" &&
+                (entry as any).id !==
+                  undefined
             )
-            .map(entry => ({
-              ...(entry as any),
-              id: String(
-                (entry as any).id
-              )
-            })) as TermEntry[]
+            .map(
+              entry => ({
+                ...(entry as any),
+                id: String(
+                  (entry as any).id
+                )
+              })
+            ) as TermEntry[]
         )
       }
     }
@@ -683,7 +617,8 @@ function normalizeTermShard(
     ) {
       if (
         item &&
-        typeof item === "object" &&
+        typeof item ===
+          "object" &&
         typeof item.term ===
           "string" &&
         Array.isArray(
@@ -697,7 +632,9 @@ function normalizeTermShard(
               (entry: any) =>
                 entry &&
                 typeof entry ===
-                  "object"
+                  "object" &&
+                entry.id !==
+                  undefined
             )
             .map(
               (entry: any) => ({
@@ -719,7 +656,8 @@ async function getTermEntries(
   env: Env,
   manifest: Manifest,
   current: CurrentRelease,
-  terms: string[]
+  terms: string[],
+  signal: AbortSignal
 ): Promise<
   Map<string, TermEntry[]>
 > {
@@ -738,74 +676,101 @@ async function getTermEntries(
       MAX_TERM_SHARDS_PER_SEARCH
     )
 
-  /*
-    This preserves your current generic
-    shard format.
-
-    We can later replace this with direct
-    term → shard routing if the indexer
-    provides shard metadata.
-  */
-
   for (
     let index = 0;
     index < shardLimit;
-    index++
+    index += TERM_SHARD_CONCURRENCY
   ) {
     if (
+      signal.aborted ||
       found.size ===
-      wanted.size
+        wanted.size
     ) {
       break
     }
 
-    const shardName =
-      manifest.term_shards[index]
-
-    const shard =
-      releasePath(
-        current.version,
-        shardName
+    const batch =
+      manifest.term_shards.slice(
+        index,
+        index +
+          TERM_SHARD_CONCURRENCY
       )
 
-    const data =
-      await fetchGzipJson(
-        env,
-        shard
-      )
+    const shardResults =
+      await Promise.allSettled(
+        batch.map(
+          async shardName => {
+            if (
+              signal.aborted
+            ) {
+              return null
+            }
 
-    const entries =
-      normalizeTermShard(data)
+            const shard =
+              releasePath(
+                current.version,
+                shardName
+              )
+
+            return fetchGzipJson(
+              env,
+              shard,
+              Math.max(
+                1000,
+                remainingTime(
+                  signal
+                )
+              ),
+              signal
+            )
+          }
+        )
+      )
 
     for (
-      const term of wanted
+      const result
+      of shardResults
     ) {
       if (
-        found.has(term)
+        result.status !==
+        "fulfilled" ||
+        !result.value
       ) {
         continue
       }
 
-      const termEntries =
-        entries.get(term)
-
-      if (
-        termEntries
-      ) {
-        found.set(
-          term,
-          termEntries
+      const entries =
+        normalizeTermShard(
+          result.value
         )
+
+      for (
+        const term of wanted
+      ) {
+        if (
+          found.has(term)
+        ) {
+          continue
+        }
+
+        const termEntries =
+          entries.get(term)
+
+        if (
+          termEntries &&
+          termEntries.length
+        ) {
+          found.set(
+            term,
+            termEntries
+          )
+        }
       }
     }
   }
 
   return found
 }
-
-/* =========================================================
-   DOCUMENT SHARDS
-   ========================================================= */
 
 function normalizeDocuments(
   data: any
@@ -865,10 +830,12 @@ async function getDocuments(
   env: Env,
   manifest: Manifest,
   current: CurrentRelease,
-  ids: number[]
+  ids: number[],
+  signal: AbortSignal
 ): Promise<Document[]> {
   if (
-    ids.length === 0
+    ids.length === 0 ||
+    signal.aborted
   ) {
     return []
   }
@@ -910,81 +877,100 @@ async function getDocuments(
       MAX_DOCUMENT_SHARDS_PER_SEARCH
     )
 
-  /*
-    Fetch several document shards
-    concurrently. Render has considerably
-    more headroom than the Worker, but the
-    concurrency is still bounded.
-  */
-
-  const CONCURRENCY = 8
-
   for (
     let index = 0;
     index <
       limitedShardIds.length;
-    index += CONCURRENCY
+    index +=
+      DOCUMENT_SHARD_CONCURRENCY
   ) {
+    if (
+      signal.aborted ||
+      documents.size ===
+        requestedIds.size
+    ) {
+      break
+    }
+
     const batch =
       limitedShardIds.slice(
         index,
-        index + CONCURRENCY
+        index +
+          DOCUMENT_SHARD_CONCURRENCY
       )
 
-    await Promise.all(
-      batch.map(
-        async shardId => {
-          const shardName =
-            manifest
-              .docs_shards[
-              shardId
-            ]
+    const shardResults =
+      await Promise.allSettled(
+        batch.map(
+          async shardId => {
+            if (
+              signal.aborted
+            ) {
+              return []
+            }
 
-          if (!shardName) {
-            return
-          }
+            const shardName =
+              manifest
+                .docs_shards[
+                shardId
+              ]
 
-          const shard =
-            releasePath(
-              current.version,
-              shardName
-            )
+            if (!shardName) {
+              return []
+            }
 
-          const data =
-            await fetchGzipJson(
-              env,
-              shard
-            )
+            const shard =
+              releasePath(
+                current.version,
+                shardName
+              )
 
-          const shardDocuments =
-            normalizeDocuments(
+            const data =
+              await fetchGzipJson(
+                env,
+                shard,
+                Math.max(
+                  1000,
+                  remainingTime(
+                    signal
+                  )
+                ),
+                signal
+              )
+
+            return normalizeDocuments(
               data
             )
-
-          for (
-            const document
-            of shardDocuments
-          ) {
-            if (
-              requestedIds.has(
-                document.id
-              )
-            ) {
-              documents.set(
-                document.id,
-                document
-              )
-            }
           }
-        }
+        )
       )
-    )
 
-    if (
-      documents.size ===
-      requestedIds.size
+    for (
+      const result
+      of shardResults
     ) {
-      break
+      if (
+        result.status !==
+        "fulfilled"
+      ) {
+        continue
+      }
+
+      for (
+        const document
+        of result.value
+      ) {
+        if (
+          requestedIds.has(
+            document.id
+          )
+        ) {
+          documents.set(
+            document.id,
+            document
+          )
+        }
+      }
     }
   }
 
@@ -1002,10 +988,6 @@ async function getDocuments(
         Boolean(document)
     )
 }
-
-/* =========================================================
-   TRUTH25
-   ========================================================= */
 
 function truth25(
   document: Document,
@@ -1084,11 +1066,8 @@ function truth25(
         const entry
         of termEntries
       ) {
-        const entryId =
-          Number(entry.id)
-
         if (
-          entryId ===
+          Number(entry.id) ===
           document.id
         ) {
           score +=
@@ -1125,10 +1104,6 @@ function truth25(
 
   return score
 }
-
-/* =========================================================
-   MEDIA
-   ========================================================= */
 
 function normalizeMedia(
   data: any
@@ -1285,21 +1260,6 @@ function mediaMatchesDocument(
     return true
   }
 
-  const mediaUrl =
-    typeof item?.url ===
-      "string"
-      ? item.url
-      : ""
-
-  if (
-    mediaUrl &&
-    normalizeUrl(
-      mediaUrl
-    ) === target
-  ) {
-    return true
-  }
-
   return false
 }
 
@@ -1376,73 +1336,95 @@ function compactMedia(
   return media
 }
 
-/* =========================================================
-   ATTACH MEDIA
-   ========================================================= */
-
 async function attachMedia(
   env: Env,
   manifest: Manifest,
   current: CurrentRelease,
-  results: SearchResult[]
+  results: SearchResult[],
+  signal: AbortSignal
 ): Promise<void> {
+  if (
+    results.length === 0 ||
+    signal.aborted
+  ) {
+    return
+  }
+
   let images: any[] =
     []
 
   let videos: any[] =
     []
 
+  const mediaPromises:
+    PromiseSettledResult<any>[] =
+    await Promise.allSettled([
+      manifest.images
+        ? fetchGzipJson(
+            env,
+            releasePath(
+              current.version,
+              manifest.images
+            ),
+            Math.min(
+              MEDIA_TIMEOUT_MS,
+              Math.max(
+                1000,
+                remainingTime(
+                  signal
+                )
+              )
+            ),
+            signal
+          )
+        : Promise.resolve([]),
+
+      manifest.videos
+        ? fetchGzipJson(
+            env,
+            releasePath(
+              current.version,
+              manifest.videos
+            ),
+            Math.min(
+              MEDIA_TIMEOUT_MS,
+              Math.max(
+                1000,
+                remainingTime(
+                  signal
+                )
+              )
+            ),
+            signal
+          )
+        : Promise.resolve([])
+    ])
+
   if (
-    manifest.images
+    mediaPromises[0]?.status ===
+    "fulfilled"
   ) {
-    try {
-      const path =
-        releasePath(
-          current.version,
-          manifest.images
-        )
-
-      const data =
-        await fetchGzipJson(
-          env,
-          path,
-          MEDIA_TIMEOUT_MS
-        )
-
-      images =
-        normalizeMedia(
-          data
-        )
-    } catch {
-      images = []
-    }
+    images =
+      normalizeMedia(
+        mediaPromises[0].value
+      )
   }
 
   if (
-    manifest.videos
+    mediaPromises[1]?.status ===
+    "fulfilled"
   ) {
-    try {
-      const path =
-        releasePath(
-          current.version,
-          manifest.videos
-        )
-
-      const data =
-        await fetchGzipJson(
-          env,
-          path,
-          MEDIA_TIMEOUT_MS
-        )
-
-      videos =
-        normalizeMedia(
-          data
-        )
-    } catch {
-      videos = []
-    }
+    videos =
+      normalizeMedia(
+        mediaPromises[1].value
+      )
   }
+
+  const imagePaths: string[] =
+    []
+
+  const thumbnailPaths: string[] =
+    []
 
   const resultImages =
     new Map<
@@ -1455,12 +1437,6 @@ async function attachMedia(
       SearchResult,
       any[]
     >()
-
-  const imagePaths: string[] =
-    []
-
-  const thumbnailPaths: string[] =
-    []
 
   for (
     const result of results
@@ -1532,71 +1508,33 @@ async function attachMedia(
     }
   }
 
-  const limitedImagePaths =
-    [
-      ...new Set(
-        imagePaths
+  const imageSignedUrls =
+    await createSignedUrlsSafe(
+      env,
+      "images",
+      [
+        ...new Set(
+          imagePaths
+        )
+      ].slice(
+        0,
+        MAX_IMAGE_SIGNED_URLS
       )
-    ].slice(
-      0,
-      MAX_IMAGE_SIGNED_URLS
     )
 
-  const limitedThumbnailPaths =
-    [
-      ...new Set(
-        thumbnailPaths
+  const thumbnailSignedUrls =
+    await createSignedUrlsSafe(
+      env,
+      "videos",
+      [
+        ...new Set(
+          thumbnailPaths
+        )
+      ].slice(
+        0,
+        MAX_IMAGE_SIGNED_URLS
       )
-    ].slice(
-      0,
-      MAX_IMAGE_SIGNED_URLS
     )
-
-  let imageSignedUrls =
-    new Map<
-      string,
-      string
-    >()
-
-  let thumbnailSignedUrls =
-    new Map<
-      string,
-      string
-    >()
-
-  if (
-    limitedImagePaths.length >
-    0
-  ) {
-    try {
-      imageSignedUrls =
-        await createSignedUrls(
-          env,
-          "images",
-          limitedImagePaths
-        )
-    } catch {
-      imageSignedUrls =
-        new Map()
-    }
-  }
-
-  if (
-    limitedThumbnailPaths.length >
-    0
-  ) {
-    try {
-      thumbnailSignedUrls =
-        await createSignedUrls(
-          env,
-          "videos",
-          limitedThumbnailPaths
-        )
-    } catch {
-      thumbnailSignedUrls =
-        new Map()
-    }
-  }
 
   for (
     const result of results
@@ -1620,8 +1558,7 @@ async function attachMedia(
             )
 
           if (
-            typeof image.path ===
-              "string" &&
+            image.path &&
             imageSignedUrls.has(
               image.path
             )
@@ -1645,8 +1582,7 @@ async function attachMedia(
             )
 
           if (
-            typeof video.thumbnail_path ===
-              "string" &&
+            video.thumbnail_path &&
             thumbnailSignedUrls.has(
               video.thumbnail_path
             )
@@ -1663,9 +1599,27 @@ async function attachMedia(
   }
 }
 
-/* =========================================================
-   RESULT FORMAT
-   ========================================================= */
+async function createSignedUrlsSafe(
+  env: Env,
+  bucket: string,
+  paths: string[]
+): Promise<Map<string, string>> {
+  if (
+    paths.length === 0
+  ) {
+    return new Map()
+  }
+
+  try {
+    return await createSignedUrls(
+      env,
+      bucket,
+      paths
+    )
+  } catch {
+    return new Map()
+  }
+}
 
 function compactResult(
   document: Document,
@@ -1685,13 +1639,22 @@ function compactResult(
   }
 }
 
-/* =========================================================
-   SEARCH
-   ========================================================= */
+function remainingTime(
+  signal: AbortSignal
+): number {
+  if (
+    signal.aborted
+  ) {
+    return 1
+  }
+
+  return 12000
+}
 
 async function handleSearch(
   request: Request,
-  env: Env
+  env: Env,
+  signal: AbortSignal
 ): Promise<Response> {
   const url =
     new URL(request.url)
@@ -1715,11 +1678,6 @@ async function handleSearch(
     detectDictionaryQuery(
       query
     )
-
-  /*
-    Dictionary-only requests don't
-    need the Seendex index.
-  */
 
   if (
     dictionaryQuery.dictionaryOnly &&
@@ -1751,13 +1709,15 @@ async function handleSearch(
 
   const current =
     await loadCurrentRelease(
-      env
+      env,
+      signal
     )
 
   const manifest =
     await loadManifest(
       env,
-      current
+      current,
+      signal
     )
 
   const termEntries =
@@ -1765,18 +1725,9 @@ async function handleSearch(
       env,
       manifest,
       current,
-      terms
+      terms,
+      signal
     )
-
-  /*
-    IMPORTANT:
-    If no term exists anywhere, return
-    immediately.
-
-    This avoids document-shard work,
-    media work, signing work and dictionary
-    work for a guaranteed empty search.
-  */
 
   if (
     termEntries.size === 0
@@ -1842,7 +1793,8 @@ async function handleSearch(
       current,
       [
         ...documentIds
-      ]
+      ],
+      signal
     )
 
   const scored =
@@ -1850,7 +1802,6 @@ async function handleSearch(
       .map(
         document => ({
           document,
-
           score:
             truth25(
               document,
@@ -1859,6 +1810,10 @@ async function handleSearch(
               termEntries
             )
         })
+      )
+      .filter(
+        item =>
+          item.score > 0
       )
       .sort(
         (a, b) =>
@@ -1870,20 +1825,8 @@ async function handleSearch(
         MAX_SEARCH_RESULTS
       )
 
-  /*
-    Don't return zero-score documents
-    simply because their ID appeared in
-    a posting list.
-  */
-
-  const useful =
-    scored.filter(
-      item =>
-        item.score > 0
-    )
-
   const results =
-    useful.map(
+    scored.map(
       item =>
         compactResult(
           item.document,
@@ -1891,19 +1834,16 @@ async function handleSearch(
         )
     )
 
-  /*
-    Media is only worth doing when
-    actual results exist.
-  */
-
   if (
-    results.length > 0
+    results.length > 0 &&
+    !signal.aborted
   ) {
     await attachMedia(
       env,
       manifest,
       current,
-      results
+      results,
+      signal
     )
   }
 
@@ -1911,7 +1851,8 @@ async function handleSearch(
     null
 
   if (
-    dictionaryQuery.word
+    dictionaryQuery.word &&
+    !signal.aborted
   ) {
     try {
       dictionary =
@@ -1930,10 +1871,6 @@ async function handleSearch(
     results
   })
 }
-
-/* =========================================================
-   NODE HTTP SERVER
-   ========================================================= */
 
 const env =
   loadEnv()
@@ -1969,12 +1906,6 @@ const server =
           return
         }
 
-        const requestUrl =
-          new URL(
-            req.url || "/",
-            `http://${req.headers.host || "localhost"}`
-          )
-
         if (
           req.method !==
           "GET"
@@ -2001,6 +1932,15 @@ const server =
           res.end(body)
           return
         }
+
+        const requestUrl =
+          new URL(
+            req.url || "/",
+            `http://${
+              req.headers.host ||
+              "localhost"
+            }`
+          )
 
         if (
           requestUrl.pathname ===
@@ -2044,46 +1984,49 @@ const server =
               }
             )
 
-          const response =
-            await Promise.race([
-              handleSearch(
-                request,
-                env
-              ),
+          const controller =
+            new AbortController()
 
-              new Promise<Response>(
-                (_, reject) =>
-                  setTimeout(
-                    () =>
-                      reject(
-                        new Error(
-                          "Search request timed out"
-                        )
-                      ),
-                    SEARCH_TIMEOUT_MS
-                  )
-              )
-            ])
-
-          const body =
-            await response.text()
-
-          res.writeHead(
-            response.status,
-            Object.fromEntries(
-              response.headers
+          const timeout =
+            setTimeout(
+              () => {
+                controller.abort()
+              },
+              SEARCH_TIMEOUT_MS
             )
-          )
 
-          res.end(body)
+          try {
+            const response =
+              await handleSearch(
+                request,
+                env,
+                controller.signal
+              )
 
-          console.log(
-            `[search] q=${JSON.stringify(
-              requestUrl.searchParams.get(
-                "q"
-              ) || ""
-            )} status=${response.status} ${Date.now() - started}ms`
-          )
+            const body =
+              await response.text()
+
+            res.writeHead(
+              response.status,
+              Object.fromEntries(
+                response.headers
+              )
+            )
+
+            res.end(body)
+
+            console.log(
+              `[search] q=${JSON.stringify(
+                requestUrl.searchParams.get(
+                  "q"
+                ) || ""
+              )} status=${response.status} ${Date.now() - started}ms`
+            )
+          } finally {
+            clearTimeout(
+              timeout
+            )
+          }
 
           return
         }
@@ -2176,10 +2119,12 @@ function shutdown(
 
 process.on(
   "SIGTERM",
-  () => shutdown("SIGTERM")
+  () =>
+    shutdown("SIGTERM")
 )
 
 process.on(
   "SIGINT",
-  () => shutdown("SIGINT")
+  () =>
+    shutdown("SIGINT")
 )
