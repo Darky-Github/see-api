@@ -518,7 +518,7 @@ async function getDictionary(
             "application/json"
         }
       },
-      5000
+      3000
     )
 
   if (!response.ok) {
@@ -712,15 +712,21 @@ async function getTermEntries(
                 shardName
               )
 
+            const timeout =
+              Math.max(
+                1000,
+                Math.min(
+                  5000,
+                  remainingTime(
+                    signal
+                  )
+                )
+              )
+
             return fetchGzipJson(
               env,
               shard,
-              Math.max(
-                1000,
-                remainingTime(
-                  signal
-                )
-              ),
+              timeout,
               signal
             )
           }
@@ -885,9 +891,7 @@ async function getDocuments(
       DOCUMENT_SHARD_CONCURRENCY
   ) {
     if (
-      signal.aborted ||
-      documents.size ===
-        requestedIds.size
+      signal.aborted
     ) {
       break
     }
@@ -925,16 +929,22 @@ async function getDocuments(
                 shardName
               )
 
+            const timeout =
+              Math.max(
+                1000,
+                Math.min(
+                  5000,
+                  remainingTime(
+                    signal
+                  )
+                )
+              )
+
             const data =
               await fetchGzipJson(
                 env,
                 shard,
-                Math.max(
-                  1000,
-                  remainingTime(
-                    signal
-                  )
-                ),
+                timeout,
                 signal
               )
 
@@ -1199,12 +1209,55 @@ function normalizeUrl(
   }
 }
 
-function getMediaPageUrl(
+function mediaDocumentIds(
   item: any
-): string {
+): string[] {
+  const fields = [
+    "document_id",
+    "documentId",
+    "doc_id",
+    "docId",
+    "result_id",
+    "resultId",
+    "page_id",
+    "pageId",
+    "parent_id",
+    "parentId",
+    "source_id",
+    "sourceId"
+  ]
+
+  const ids: string[] =
+    []
+
+  for (
+    const field of fields
+  ) {
+    const value =
+      item?.[field]
+
+    if (
+      value !== undefined &&
+      value !== null &&
+      String(value).trim()
+    ) {
+      ids.push(
+        String(value)
+      )
+    }
+  }
+
+  return ids
+}
+
+function mediaDocumentUrls(
+  item: any
+): string[] {
   const fields = [
     "page_url",
+    "pageUrl",
     "source_url",
+    "sourceUrl",
     "source",
     "document_url",
     "documentUrl",
@@ -1212,53 +1265,105 @@ function getMediaPageUrl(
     "parentUrl",
     "origin_url",
     "originUrl",
-    "page",
     "source_page",
-    "sourcePage"
+    "sourcePage",
+    "page",
+    "parent",
+    "url"
   ]
+
+  const urls: string[] =
+    []
 
   for (
     const field of fields
   ) {
+    const value =
+      item?.[field]
+
     if (
-      typeof item?.[
-        field
-      ] === "string" &&
-      item[field].trim()
+      typeof value ===
+        "string" &&
+      value.trim()
     ) {
-      return item[field]
+      urls.push(
+        normalizeUrl(value)
+      )
     }
   }
 
-  return ""
+  return [
+    ...new Set(
+      urls.filter(Boolean)
+    )
+  ]
 }
 
 function mediaMatchesDocument(
   item: any,
-  documentUrl: string
+  document: Document
 ): boolean {
-  const target =
-    normalizeUrl(
-      documentUrl
-    )
+  const documentId =
+    String(document.id)
 
-  if (!target) {
-    return false
-  }
-
-  const pageUrl =
-    getMediaPageUrl(
-      item
-    )
+  const ids =
+    mediaDocumentIds(item)
 
   if (
-    pageUrl &&
-    normalizeUrl(
-      pageUrl
-    ) === target
+    ids.includes(
+      documentId
+    )
   ) {
     return true
   }
+
+  const documentUrl =
+    normalizeUrl(
+      document.url
+    )
+
+  if (!documentUrl) {
+    return false
+  }
+
+  const urls =
+    mediaDocumentUrls(item)
+
+  if (
+    urls.includes(
+      documentUrl
+    )
+  ) {
+    return true
+  }
+
+  try {
+    const target =
+      new URL(
+        documentUrl
+      )
+
+    for (
+      const mediaUrl
+      of urls
+    ) {
+      try {
+        const source =
+          new URL(
+            mediaUrl
+          )
+
+        if (
+          source.hostname ===
+            target.hostname &&
+          source.pathname ===
+            target.pathname
+        ) {
+          return true
+        }
+      } catch {}
+    }
+  } catch {}
 
   return false
 }
@@ -1336,6 +1441,28 @@ function compactMedia(
   return media
 }
 
+async function createSignedUrlsSafe(
+  env: Env,
+  bucket: string,
+  paths: string[]
+): Promise<Map<string, string>> {
+  if (
+    paths.length === 0
+  ) {
+    return new Map()
+  }
+
+  try {
+    return await createSignedUrls(
+      env,
+      bucket,
+      paths
+    )
+  } catch {
+    return new Map()
+  }
+}
+
 async function attachMedia(
   env: Env,
   manifest: Manifest,
@@ -1350,14 +1477,7 @@ async function attachMedia(
     return
   }
 
-  let images: any[] =
-    []
-
-  let videos: any[] =
-    []
-
-  const mediaPromises:
-    PromiseSettledResult<any>[] =
+  const mediaResults =
     await Promise.allSettled([
       manifest.images
         ? fetchGzipJson(
@@ -1400,54 +1520,60 @@ async function attachMedia(
         : Promise.resolve([])
     ])
 
-  if (
-    mediaPromises[0]?.status ===
+  const images =
+    mediaResults[0]?.status ===
     "fulfilled"
-  ) {
-    images =
-      normalizeMedia(
-        mediaPromises[0].value
-      )
-  }
+      ? normalizeMedia(
+          mediaResults[0].value
+        )
+      : []
 
-  if (
-    mediaPromises[1]?.status ===
+  const videos =
+    mediaResults[1]?.status ===
     "fulfilled"
-  ) {
-    videos =
-      normalizeMedia(
-        mediaPromises[1].value
-      )
-  }
+      ? normalizeMedia(
+          mediaResults[1].value
+        )
+      : []
 
   const imagePaths: string[] =
     []
 
-  const thumbnailPaths: string[] =
+  const videoThumbnailPaths:
+    string[] =
     []
 
-  const resultImages =
+  const imageMatches =
     new Map<
-      SearchResult,
+      number,
       any[]
     >()
 
-  const resultVideos =
+  const videoMatches =
     new Map<
-      SearchResult,
+      number,
       any[]
     >()
 
   for (
     const result of results
   ) {
+    const document: Document = {
+      id: result.id,
+      url: result.url,
+      title: result.title,
+      description:
+        result.description,
+      text: ""
+    }
+
     const matchedImages =
       images
         .filter(
           image =>
             mediaMatchesDocument(
               image,
-              result.url
+              document
             )
         )
         .slice(
@@ -1461,7 +1587,7 @@ async function attachMedia(
           video =>
             mediaMatchesDocument(
               video,
-              result.url
+              document
             )
         )
         .slice(
@@ -1469,13 +1595,13 @@ async function attachMedia(
           MAX_VIDEOS_PER_RESULT
         )
 
-    resultImages.set(
-      result,
+    imageMatches.set(
+      result.id,
       matchedImages
     )
 
-    resultVideos.set(
-      result,
+    videoMatches.set(
+      result.id,
       matchedVideos
     )
 
@@ -1501,7 +1627,7 @@ async function attachMedia(
         typeof video.thumbnail_path ===
           "string"
       ) {
-        thumbnailPaths.push(
+        videoThumbnailPaths.push(
           video.thumbnail_path
         )
       }
@@ -1522,13 +1648,13 @@ async function attachMedia(
       )
     )
 
-  const thumbnailSignedUrls =
+  const videoThumbnailSignedUrls =
     await createSignedUrlsSafe(
       env,
       "videos",
       [
         ...new Set(
-          thumbnailPaths
+          videoThumbnailPaths
         )
       ].slice(
         0,
@@ -1540,13 +1666,13 @@ async function attachMedia(
     const result of results
   ) {
     const matchedImages =
-      resultImages.get(
-        result
+      imageMatches.get(
+        result.id
       ) || []
 
     const matchedVideos =
-      resultVideos.get(
-        result
+      videoMatches.get(
+        result.id
       ) || []
 
     result.images =
@@ -1583,12 +1709,12 @@ async function attachMedia(
 
           if (
             video.thumbnail_path &&
-            thumbnailSignedUrls.has(
+            videoThumbnailSignedUrls.has(
               video.thumbnail_path
             )
           ) {
             media.thumbnail =
-              thumbnailSignedUrls.get(
+              videoThumbnailSignedUrls.get(
                 video.thumbnail_path
               )
           }
@@ -1596,28 +1722,6 @@ async function attachMedia(
           return media
         }
       )
-  }
-}
-
-async function createSignedUrlsSafe(
-  env: Env,
-  bucket: string,
-  paths: string[]
-): Promise<Map<string, string>> {
-  if (
-    paths.length === 0
-  ) {
-    return new Map()
-  }
-
-  try {
-    return await createSignedUrls(
-      env,
-      bucket,
-      paths
-    )
-  } catch {
-    return new Map()
   }
 }
 
@@ -1761,7 +1865,7 @@ async function handleSearch(
 
         if (
           documentIds.size >=
-          MAX_TERM_ENTRY_DOCUMENTS
+          MAX_DOCUMENT_IDS
         ) {
           break
         }
@@ -1770,7 +1874,7 @@ async function handleSearch(
 
     if (
       documentIds.size >=
-      MAX_TERM_ENTRY_DOCUMENTS
+      MAX_DOCUMENT_IDS
     ) {
       break
     }
