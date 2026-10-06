@@ -150,7 +150,7 @@ const env = loadEnv()
 
 function timeoutSignal(
   timeoutMs: number,
-  signal?: AbortSignal
+  signal?: AbortSignal | null
 ): AbortSignal {
   const timeout =
     AbortSignal.timeout(timeoutMs)
