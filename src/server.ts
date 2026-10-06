@@ -4,14 +4,49 @@ import { promisify } from "node:util"
 
 const gunzipAsync = promisify(gunzip)
 
-type Env = {
+/* =========================================================
+   TYPES
+   ========================================================= */
+
+interface Env {
   SUPABASE_URL: string
   SUPABASE_SECRET_KEY: string
 }
 
-type JsonObject = Record<string, unknown>
+interface Manifest {
+  version: string
+  docs_shards: string[]
+  term_shards: string[]
+  fingerprints?: string
+  images?: string
+  videos?: string
+}
 
-type SearchResult = {
+interface CurrentRelease {
+  version: string
+  manifest: string
+  fingerprints?: string
+  documents: number
+  images: number
+  videos: number
+}
+
+interface Document {
+  id: number
+  url: string
+  title: string
+  description: string
+  text: string
+  content_hash?: string
+}
+
+interface TermEntry {
+  id: string | number
+  tf: number
+  title?: number
+}
+
+interface SearchResult {
   id: number
   url: string
   title: string
@@ -21,7 +56,7 @@ type SearchResult = {
   videos: MediaItem[]
 }
 
-type MediaItem = {
+interface MediaItem {
   url?: string
   path?: string
   title?: string
@@ -30,1609 +65,127 @@ type MediaItem = {
   mime_type?: string
   thumbnail?: string
   thumbnail_path?: string
-  [key: string]: unknown
 }
 
-type Document = {
-  id: number
-  url: string
-  title?: string
-  description?: string
-  text?: string
-  [key: string]: unknown
+/* =========================================================
+   CONFIGURATION
+   ========================================================= */
+
+const MAX_DOCUMENT_IDS = 1000
+
+const MAX_SEARCH_RESULTS = 25
+
+const MAX_IMAGES_PER_RESULT = 4
+
+const MAX_VIDEOS_PER_RESULT = 2
+
+const MAX_IMAGE_SIGNED_URLS = 100
+
+const MAX_VIDEO_SIGNED_URLS = 100
+
+const SIGNED_URL_EXPIRES = 3600
+
+const MAX_TERM_SHARDS_PER_SEARCH = 128
+
+const MAX_DOCUMENT_SHARDS_PER_SEARCH = 128
+
+const MAX_TERM_ENTRY_DOCUMENTS = 1000
+
+const TERM_SHARD_CONCURRENCY = 12
+
+const DOCUMENT_SHARD_CONCURRENCY = 12
+
+const MEDIA_MANIFEST_CONCURRENCY = 2
+
+const SIGNED_URL_CONCURRENCY = 12
+
+const SEARCH_TIMEOUT_MS = 15000
+
+const MEDIA_TIMEOUT_MS = 5000
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization",
+  "Access-Control-Max-Age": "86400"
 }
 
-type Posting = {
-  id: number
-  tf?: number
-  title_tf?: number
-  [key: string]: unknown
-}
-
-type DictionaryEntry = {
-  term?: string
-  df?: number
-  idf?: number
-  postings?: Posting[]
-  [key: string]: unknown
-}
-
-type Manifest = {
-  docs_shards?: unknown
-  term_shards?: unknown
-  fingerprints?: unknown
-  images?: unknown
-  videos?: unknown
-  [key: string]: unknown
-}
-
-type Release = {
-  manifest?: string
-  manifest_path?: string
-  [key: string]: unknown
-}
-
-const CONFIG = {
-  requestTimeoutMs: 25000,
-  fetchTimeoutMs: 10000,
-  mediaTimeoutMs: 12000,
-
-  termShardConcurrency: 12,
-  documentShardConcurrency: 12,
-
-  maxDocumentIds: 1000,
-  maxSearchResults: 25,
-
-  maxImagesPerResult: 4,
-  maxVideosPerResult: 2,
-
-  maxImageSignedUrls: 100,
-
-  signedUrlExpires: 3600
-}
+/* =========================================================
+   ENVIRONMENT
+   ========================================================= */
 
 function loadEnv(): Env {
-  const SUPABASE_URL = process.env.SUPABASE_URL
-  const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY
+  const SUPABASE_URL =
+    process.env.SUPABASE_URL?.trim()
+
+  const SUPABASE_SECRET_KEY =
+    process.env.SUPABASE_SECRET_KEY?.trim()
 
   if (!SUPABASE_URL) {
-    throw new Error("Missing SUPABASE_URL")
+    throw new Error(
+      "Missing SUPABASE_URL environment variable"
+    )
   }
 
   if (!SUPABASE_SECRET_KEY) {
-    throw new Error("Missing SUPABASE_SECRET_KEY")
+    throw new Error(
+      "Missing SUPABASE_SECRET_KEY environment variable"
+    )
   }
 
   return {
-    SUPABASE_URL: SUPABASE_URL.replace(/\/+$/, ""),
+    SUPABASE_URL:
+      SUPABASE_URL.replace(/\/+$/, ""),
+
     SUPABASE_SECRET_KEY
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+const env = loadEnv()
+
+/* =========================================================
+   REQUEST HELPERS
+   ========================================================= */
+
+function timeoutSignal(
+  timeoutMs: number,
+  signal?: AbortSignal
+): AbortSignal {
+  const timeout =
+    AbortSignal.timeout(timeoutMs)
+
+  if (!signal) {
+    return timeout
+  }
+
+  return AbortSignal.any([
+    signal,
+    timeout
+  ])
 }
 
 async function fetchWithTimeout(
-  url: string,
+  input: RequestInfo | URL,
   init: RequestInit = {},
-  timeoutMs = CONFIG.fetchTimeoutMs,
-  signal?: AbortSignal
+  timeoutMs = SEARCH_TIMEOUT_MS
 ): Promise<Response> {
-  const controller = new AbortController()
-
-  const timeout = setTimeout(() => {
-    controller.abort()
-  }, timeoutMs)
-
-  const abortFromParent = () => {
-    controller.abort()
-  }
-
-  if (signal) {
-    if (signal.aborted) {
-      controller.abort()
-    } else {
-      signal.addEventListener("abort", abortFromParent, { once: true })
-    }
-  }
-
-  try {
-    return await fetch(url, {
+  return fetch(
+    input,
+    {
       ...init,
-      signal: controller.signal
-    })
-  } finally {
-    clearTimeout(timeout)
-
-    if (signal) {
-      signal.removeEventListener("abort", abortFromParent)
-    }
-  }
-}
-
-async function fetchBytes(
-  url: string,
-  timeoutMs = CONFIG.fetchTimeoutMs,
-  signal?: AbortSignal
-): Promise<Uint8Array> {
-  const response = await fetchWithTimeout(
-    url,
-    {},
-    timeoutMs,
-    signal
-  )
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`)
-  }
-
-  return new Uint8Array(await response.arrayBuffer())
-}
-
-async function fetchGzipText(
-  url: string,
-  timeoutMs = CONFIG.fetchTimeoutMs,
-  signal?: AbortSignal
-): Promise<string> {
-  const bytes = await fetchBytes(url, timeoutMs, signal)
-
-  const decompressed = await gunzipAsync(bytes)
-
-  return decompressed.toString("utf8")
-}
-
-async function fetchJson<T>(
-  url: string,
-  timeoutMs = CONFIG.fetchTimeoutMs,
-  signal?: AbortSignal
-): Promise<T> {
-  const text = await fetchGzipText(url, timeoutMs, signal)
-
-  return JSON.parse(text) as T
-}
-
-function parseJsonOrJsonl<T>(text: string): T[] | T {
-  const trimmed = text.trim()
-
-  if (!trimmed) {
-    return []
-  }
-
-  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
-    return JSON.parse(trimmed) as T[] | T
-  }
-
-  return trimmed
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => JSON.parse(line) as T)
-}
-
-function asArray<T>(value: T[] | T): T[] {
-  if (Array.isArray(value)) {
-    return value
-  }
-
-  return [value]
-}
-
-function joinUrl(base: string, path: string): string {
-  if (/^https?:\/\//i.test(path)) {
-    return path
-  }
-
-  return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`
-}
-
-function getStorageObjectUrl(
-  env: Env,
-  bucket: string,
-  path: string
-): string {
-  return `${env.SUPABASE_URL}/storage/v1/object/public/${bucket}/${path}`
-}
-
-async function createSignedUrl(
-  env: Env,
-  bucket: string,
-  path: string,
-  expiresIn = CONFIG.signedUrlExpires,
-  signal?: AbortSignal
-): Promise<string | null> {
-  if (!path) {
-    return null
-  }
-
-  const url =
-    `${env.SUPABASE_URL}/storage/v1/object/sign/` +
-    `${encodeURIComponent(bucket)}/${path.replace(/^\/+/, "")}`
-
-  try {
-    const response = await fetchWithTimeout(
-      url,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-          apikey: env.SUPABASE_SECRET_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          expiresIn
-        })
-      },
-      CONFIG.mediaTimeoutMs,
-      signal
-    )
-
-    if (!response.ok) {
-      return null
-    }
-
-    const data = await response.json() as {
-      signedURL?: string
-      signedUrl?: string
-      path?: string
-      token?: string
-    }
-
-    if (data.signedURL) {
-      if (data.signedURL.startsWith("http")) {
-        return data.signedURL
-      }
-
-      return `${env.SUPABASE_URL}${data.signedURL}`
-    }
-
-    if (data.signedUrl) {
-      if (data.signedUrl.startsWith("http")) {
-        return data.signedUrl
-      }
-
-      return `${env.SUPABASE_URL}${data.signedUrl}`
-    }
-
-    if (data.path) {
-      if (data.path.startsWith("http")) {
-        return data.path
-      }
-
-      return `${env.SUPABASE_URL}${data.path}`
-    }
-
-    if (data.token) {
-      return (
-        `${env.SUPABASE_URL}/storage/v1/object/sign/` +
-        `${encodeURIComponent(bucket)}/` +
-        `${path.replace(/^\/+/, "")}?token=${encodeURIComponent(data.token)}`
-      )
-    }
-
-    return null
-  } catch {
-    return null
-  }
-}
-
-function tokenize(value: string): string[] {
-  return value
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .split(/\s+/)
-    .map(token => token.trim())
-    .filter(Boolean)
-}
-
-function unique<T>(items: T[]): T[] {
-  return [...new Set(items)]
-}
-
-function getString(
-  object: JsonObject | undefined,
-  keys: string[]
-): string {
-  if (!object) {
-    return ""
-  }
-
-  for (const key of keys) {
-    const value = object[key]
-
-    if (typeof value === "string") {
-      return value
-    }
-  }
-
-  return ""
-}
-
-function getNumber(
-  object: JsonObject | undefined,
-  keys: string[],
-  fallback = 0
-): number {
-  if (!object) {
-    return fallback
-  }
-
-  for (const key of keys) {
-    const value = object[key]
-
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value
-    }
-
-    if (typeof value === "string") {
-      const parsed = Number(value)
-
-      if (Number.isFinite(parsed)) {
-        return parsed
-      }
-    }
-  }
-
-  return fallback
-}
-
-function extractShardList(
-  value: unknown
-): string[] {
-  if (!value) {
-    return []
-  }
-
-  if (Array.isArray(value)) {
-    return value.filter(
-      item => typeof item === "string"
-    ) as string[]
-  }
-
-  if (typeof value === "string") {
-    return [value]
-  }
-
-  if (typeof value === "object") {
-    const object = value as JsonObject
-
-    for (const key of [
-      "shards",
-      "files",
-      "paths",
-      "items",
-      "urls"
-    ]) {
-      const result = extractShardList(object[key])
-
-      if (result.length) {
-        return result
-      }
-    }
-  }
-
-  return []
-}
-
-function getManifestPath(
-  release: Release
-): string {
-  return (
-    getString(release, [
-      "manifest",
-      "manifest_path"
-    ]) ||
-    ""
-  )
-}
-
-async function loadCurrentRelease(
-  env: Env,
-  signal?: AbortSignal
-): Promise<Release> {
-  const url = getStorageObjectUrl(
-    env,
-    "seendex",
-    "current.json"
-  )
-
-  const response = await fetchWithTimeout(
-    url,
-    {
-      headers: {
-        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-        apikey: env.SUPABASE_SECRET_KEY
-      }
-    },
-    CONFIG.fetchTimeoutMs,
-    signal
-  )
-
-  if (!response.ok) {
-    throw new Error(
-      `Unable to load current.json: HTTP ${response.status}`
-    )
-  }
-
-  return await response.json() as Release
-}
-
-async function loadManifest(
-  env: Env,
-  release: Release,
-  signal?: AbortSignal
-): Promise<Manifest> {
-  const manifestPath = getManifestPath(release)
-
-  if (!manifestPath) {
-    throw new Error("Release does not contain a manifest path")
-  }
-
-  const url = getStorageObjectUrl(
-    env,
-    "seendex",
-    manifestPath
-  )
-
-  const response = await fetchWithTimeout(
-    url,
-    {
-      headers: {
-        Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-        apikey: env.SUPABASE_SECRET_KEY
-      }
-    },
-    CONFIG.fetchTimeoutMs,
-    signal
-  )
-
-  if (!response.ok) {
-    throw new Error(
-      `Unable to load manifest: HTTP ${response.status}`
-    )
-  }
-
-  const data = await response.json()
-
-  return data as Manifest
-}
-
-async function fetchShard(
-  env: Env,
-  path: string,
-  signal?: AbortSignal
-): Promise<string> {
-  const url = getStorageObjectUrl(
-    env,
-    "seendex",
-    path
-  )
-
-  return fetchGzipText(
-    url,
-    CONFIG.fetchTimeoutMs,
-    signal
-  )
-}
-
-async function mapConcurrent<T, R>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<R>
-): Promise<R[]> {
-  const results = new Array<R>(items.length)
-
-  let cursor = 0
-
-  async function runWorker() {
-    while (true) {
-      const index = cursor++
-
-      if (index >= items.length) {
-        return
-      }
-
-      results[index] = await worker(items[index], index)
-    }
-  }
-
-  const workers = Math.min(
-    Math.max(1, concurrency),
-    items.length
-  )
-
-  await Promise.all(
-    Array.from(
-      { length: workers },
-      () => runWorker()
-    )
-  )
-
-  return results
-}
-
-function normalizeDictionary(
-  value: unknown
-): DictionaryEntry[] {
-  if (!value) {
-    return []
-  }
-
-  if (Array.isArray(value)) {
-    return value.filter(
-      item =>
-        item !== null &&
-        typeof item === "object"
-    ) as DictionaryEntry[]
-  }
-
-  if (typeof value === "object") {
-    const object = value as JsonObject
-
-    if (Array.isArray(object.items)) {
-      return object.items.filter(
-        item =>
-          item !== null &&
-          typeof item === "object"
-      ) as DictionaryEntry[]
-    }
-
-    return Object.entries(object).map(
-      ([term, data]) => {
-        if (
-          data &&
-          typeof data === "object" &&
-          !Array.isArray(data)
-        ) {
-          return {
-            term,
-            ...(data as JsonObject)
-          } as DictionaryEntry
-        }
-
-        return {
-          term
-        }
-      }
-    )
-  }
-
-  return []
-}
-
-function getDictionaryTerm(
-  entry: DictionaryEntry
-): string {
-  return (
-    entry.term ||
-    getString(entry, ["key", "token", "word"])
-  ).toLowerCase()
-}
-
-function getPostings(
-  entry: DictionaryEntry
-): Posting[] {
-  const postings = entry.postings
-
-  if (Array.isArray(postings)) {
-    return postings.filter(
-      posting =>
-        posting !== null &&
-        typeof posting === "object"
-    ) as Posting[]
-  }
-
-  const object = entry as JsonObject
-
-  for (const key of [
-    "docs",
-    "documents",
-    "posting",
-    "ids"
-  ]) {
-    const value = object[key]
-
-    if (Array.isArray(value)) {
-      return value.map(item => {
-        if (
-          typeof item === "number"
-        ) {
-          return {
-            id: item
-          }
-        }
-
-        if (
-          typeof item === "string"
-        ) {
-          return {
-            id: Number(item)
-          }
-        }
-
-        if (
-          item &&
-          typeof item === "object"
-        ) {
-          return item as Posting
-        }
-
-        return {
-          id: -1
-        }
-      }).filter(
-        posting =>
-          Number.isFinite(posting.id)
-      )
-    }
-  }
-
-  return []
-}
-
-function getPostingId(
-  posting: Posting
-): number {
-  return getNumber(
-    posting as JsonObject,
-    ["id", "doc_id", "docId", "document_id"],
-    -1
-  )
-}
-
-function getPostingTf(
-  posting: Posting
-): number {
-  return getNumber(
-    posting as JsonObject,
-    ["tf", "term_frequency", "termFrequency"],
-    1
-  )
-}
-
-function getPostingTitleTf(
-  posting: Posting
-): number {
-  return getNumber(
-    posting as JsonObject,
-    ["title_tf", "titleTf"],
-    0
-  )
-}
-
-function getDictionaryDf(
-  entry: DictionaryEntry
-): number {
-  return getNumber(
-    entry as JsonObject,
-    ["df", "document_frequency", "documentFrequency"],
-    0
-  )
-}
-
-function getDictionaryIdf(
-  entry: DictionaryEntry
-): number {
-  return getNumber(
-    entry as JsonObject,
-    ["idf"],
-    0
-  )
-}
-
-async function loadTermEntries(
-  env: Env,
-  manifest: Manifest,
-  terms: string[],
-  signal?: AbortSignal
-): Promise<Map<string, DictionaryEntry>> {
-  const shardPaths = extractShardList(
-    manifest.term_shards
-  )
-
-  const output = new Map<string, DictionaryEntry>()
-
-  if (!shardPaths.length || !terms.length) {
-    return output
-  }
-
-  const wanted = new Set(terms)
-
-  const texts = await mapConcurrent(
-    shardPaths,
-    CONFIG.termShardConcurrency,
-    async path => {
-      try {
-        return await fetchShard(
-          env,
-          path,
-          signal
+      signal:
+        timeoutSignal(
+          timeoutMs,
+          init.signal
         )
-      } catch {
-        return ""
-      }
     }
   )
-
-  for (const text of texts) {
-    if (!text) {
-      continue
-    }
-
-    let parsed: DictionaryEntry[] = []
-
-    try {
-      parsed = normalizeDictionary(
-        parseJsonOrJsonl<DictionaryEntry>(text)
-      )
-    } catch {
-      continue
-    }
-
-    for (const entry of parsed) {
-      const term = getDictionaryTerm(entry)
-
-      if (wanted.has(term)) {
-        output.set(term, entry)
-      }
-    }
-  }
-
-  return output
 }
 
-function documentFromUnknown(
-  value: unknown
-): Document | null {
-  if (!value || typeof value !== "object") {
-    return null
-  }
-
-  const object = value as JsonObject
-
-  const id = getNumber(
-    object,
-    ["id", "doc_id", "docId", "document_id"],
-    -1
-  )
-
-  if (!Number.isFinite(id) || id < 0) {
-    return null
-  }
-
-  const url = getString(
-    object,
-    ["url", "link", "href"]
-  )
-
-  if (!url) {
-    return null
-  }
-
-  return {
-    ...object,
-    id,
-    url,
-    title: getString(object, [
-      "title",
-      "name"
-    ]),
-    description: getString(object, [
-      "description",
-      "desc",
-      "snippet"
-    ]),
-    text: getString(object, [
-      "text",
-      "content",
-      "body"
-    ])
-  }
-}
-
-function extractDocuments(
-  value: unknown
-): Document[] {
-  if (!value) {
-    return []
-  }
-
-  if (Array.isArray(value)) {
-    return value
-      .map(documentFromUnknown)
-      .filter(
-        (document): document is Document =>
-          document !== null
-      )
-  }
-
-  if (typeof value === "object") {
-    const object = value as JsonObject
-
-    for (const key of [
-      "documents",
-      "docs",
-      "items",
-      "data"
-    ]) {
-      if (object[key]) {
-        const documents = extractDocuments(
-          object[key]
-        )
-
-        if (documents.length) {
-          return documents
-        }
-      }
-    }
-
-    const document = documentFromUnknown(
-      object
-    )
-
-    return document ? [document] : []
-  }
-
-  return []
-}
-
-function documentShardIndex(
-  id: number
-): number {
-  return Math.floor(id / 250)
-}
-
-function resolveDocumentShardPath(
-  manifest: Manifest,
-  shardIndex: number
-): string | null {
-  const shards = extractShardList(
-    manifest.docs_shards
-  )
-
-  if (!shards.length) {
-    return null
-  }
-
-  if (
-    shardIndex >= 0 &&
-    shardIndex < shards.length
-  ) {
-    return shards[shardIndex]
-  }
-
-  const candidates = [
-    String(shardIndex),
-    `${shardIndex}.json.gz`,
-    `docs_${shardIndex}.json.gz`,
-    `docs-${shardIndex}.json.gz`,
-    `shard_${shardIndex}.json.gz`,
-    `shard-${shardIndex}.json.gz`
-  ]
-
-  for (const candidate of candidates) {
-    const match = shards.find(
-      path =>
-        path === candidate ||
-        path.endsWith(`/${candidate}`)
-    )
-
-    if (match) {
-      return match
-    }
-  }
-
-  return null
-}
-
-async function loadDocuments(
-  env: Env,
-  manifest: Manifest,
-  ids: number[],
-  signal?: AbortSignal
-): Promise<Map<number, Document>> {
-  const output = new Map<number, Document>()
-
-  if (!ids.length) {
-    return output
-  }
-
-  const shardIds = unique(
-    ids.map(documentShardIndex)
-  )
-
-  const shardPaths = shardIds
-    .map(index => ({
-      index,
-      path: resolveDocumentShardPath(
-        manifest,
-        index
-      )
-    }))
-    .filter(
-      item => Boolean(item.path)
-    ) as {
-      index: number
-      path: string
-    }[]
-
-  const texts = await mapConcurrent(
-    shardPaths,
-    CONFIG.documentShardConcurrency,
-    async item => {
-      try {
-        return {
-          index: item.index,
-          text: await fetchShard(
-            env,
-            item.path,
-            signal
-          )
-        }
-      } catch {
-        return {
-          index: item.index,
-          text: ""
-        }
-      }
-    }
-  )
-
-  const wanted = new Set(ids)
-
-  for (const shard of texts) {
-    if (!shard.text) {
-      continue
-    }
-
-    let parsed: unknown
-
-    try {
-      parsed = parseJsonOrJsonl<unknown>(
-        shard.text
-      )
-    } catch {
-      continue
-    }
-
-    for (const document of extractDocuments(
-      parsed
-    )) {
-      if (wanted.has(document.id)) {
-        output.set(document.id, document)
-      }
-    }
-  }
-
-  return output
-}
-
-function scoreDocument(
-  document: Document,
-  query: string,
-  queryTerms: string[],
-  entries: Map<string, DictionaryEntry>,
-  postingMap: Map<number, Map<string, Posting>>
-): number {
-  const title = (
-    document.title || ""
-  ).toLowerCase()
-
-  const description = (
-    document.description || ""
-  ).toLowerCase()
-
-  const text = (
-    document.text || ""
-  ).toLowerCase()
-
-  const url = document.url.toLowerCase()
-
-  let score = 0
-
-  for (const term of queryTerms) {
-    if (title.includes(term)) {
-      score += 25
-    }
-
-    if (description.includes(term)) {
-      score += 8
-    }
-
-    if (text.includes(term)) {
-      score += 3
-    }
-
-    if (url.includes(term)) {
-      score += 5
-    }
-
-    const posting = postingMap
-      .get(document.id)
-      ?.get(term)
-
-    if (posting) {
-      score += getPostingTf(posting) * 2
-      score += getPostingTitleTf(posting) * 8
-    }
-
-    const entry = entries.get(term)
-
-    if (entry) {
-      const idf = getDictionaryIdf(entry)
-
-      if (idf > 0) {
-        score += idf
-      }
-    }
-  }
-
-  if (
-    query &&
-    title.includes(query.toLowerCase())
-  ) {
-    score += 25
-  }
-
-  const textLength = text.length
-
-  score += Math.min(
-    5,
-    textLength / 2000
-  )
-
-  return score
-}
-
-function normalizeUrl(
-  value: unknown
-): string {
-  if (typeof value !== "string") {
-    return ""
-  }
-
-  try {
-    const url = new URL(value)
-
-    url.hash = ""
-
-    let normalized = url.toString()
-
-    if (normalized.endsWith("/")) {
-      normalized = normalized.slice(0, -1)
-    }
-
-    return normalized.toLowerCase()
-  } catch {
-    return value
-      .trim()
-      .replace(/#.*$/, "")
-      .replace(/\/+$/, "")
-      .toLowerCase()
-  }
-}
-
-function normalizeMedia(
-  data: unknown
-): MediaItem[] {
-  if (Array.isArray(data)) {
-    return data.filter(
-      item =>
-        item !== null &&
-        typeof item === "object"
-    ) as MediaItem[]
-  }
-
-  if (!data || typeof data !== "object") {
-    return []
-  }
-
-  const object = data as JsonObject
-
-  for (const key of [
-    "items",
-    "media",
-    "images",
-    "videos"
-  ]) {
-    const value = object[key]
-
-    if (Array.isArray(value)) {
-      return value.filter(
-        item =>
-          item !== null &&
-          typeof item === "object"
-      ) as MediaItem[]
-    }
-  }
-
-  return []
-}
-
-function getMediaPageUrl(
-  item: MediaItem
-): string {
-  for (const key of [
-    "page_url",
-    "source_url",
-    "source",
-    "document_url",
-    "documentUrl",
-    "parent_url",
-    "parentUrl",
-    "origin_url",
-    "originUrl",
-    "page",
-    "source_page",
-    "sourcePage"
-  ]) {
-    const value = item[key]
-
-    if (typeof value === "string") {
-      return value
-    }
-  }
-
-  return ""
-}
-
-function mediaMatchesDocument(
-  item: MediaItem,
-  documentUrl: string
-): boolean {
-  const normalizedDocument =
-    normalizeUrl(documentUrl)
-
-  const mediaPage =
-    normalizeUrl(
-      getMediaPageUrl(item)
-    )
-
-  if (
-    mediaPage &&
-    mediaPage === normalizedDocument
-  ) {
-    return true
-  }
-
-  const mediaUrl =
-    normalizeUrl(item.url)
-
-  if (
-    mediaUrl &&
-    mediaUrl === normalizedDocument
-  ) {
-    return true
-  }
-
-  return false
-}
-
-function compactMedia(
-  item: MediaItem
-): MediaItem {
-  return {
-    ...(item.url !== undefined
-      ? { url: item.url }
-      : {}),
-    ...(item.path !== undefined
-      ? { path: item.path }
-      : {}),
-    ...(item.title !== undefined
-      ? { title: item.title }
-      : {}),
-    ...(item.alt !== undefined
-      ? { alt: item.alt }
-      : {}),
-    ...(item.type !== undefined
-      ? { type: item.type }
-      : {}),
-    ...(item.mime_type !== undefined
-      ? { mime_type: item.mime_type }
-      : {}),
-    ...(item.thumbnail !== undefined
-      ? { thumbnail: item.thumbnail }
-      : {}),
-    ...(item.thumbnail_path !== undefined
-      ? { thumbnail_path: item.thumbnail_path }
-      : {})
-  }
-}
-
-async function loadMediaManifest(
-  env: Env,
-  path: string,
-  signal?: AbortSignal
-): Promise<MediaItem[]> {
-  try {
-    const text = await fetchShard(
-      env,
-      path,
-      signal
-    )
-
-    const parsed =
-      parseJsonOrJsonl<MediaItem>(text)
-
-    return normalizeMedia(parsed)
-  } catch {
-    return []
-  }
-}
-
-async function attachMedia(
-  env: Env,
-  manifest: Manifest,
-  results: SearchResult[],
-  signal?: AbortSignal
-): Promise<void> {
-  const imagePaths =
-    extractShardList(
-      manifest.images
-    )
-
-  const videoPaths =
-    extractShardList(
-      manifest.videos
-    )
-
-  if (
-    !imagePaths.length &&
-    !videoPaths.length
-  ) {
-    return
-  }
-
-  const [imageResults, videoResults] =
-    await Promise.all([
-      Promise.all(
-        imagePaths.map(path =>
-          loadMediaManifest(
-            env,
-            path,
-            signal
-          )
-        )
-      ),
-      Promise.all(
-        videoPaths.map(path =>
-          loadMediaManifest(
-            env,
-            path,
-            signal
-          )
-        )
-      )
-    ])
-
-  const allImages =
-    imageResults.flat()
-
-  const allVideos =
-    videoResults.flat()
-
-  const imageSigningPaths: string[] = []
-
-  for (const result of results) {
-    const matchedImages =
-      allImages
-        .filter(item =>
-          mediaMatchesDocument(
-            item,
-            result.url
-          )
-        )
-        .slice(
-          0,
-          CONFIG.maxImagesPerResult
-        )
-        .map(compactMedia)
-
-    const matchedVideos =
-      allVideos
-        .filter(item =>
-          mediaMatchesDocument(
-            item,
-            result.url
-          )
-        )
-        .slice(
-          0,
-          CONFIG.maxVideosPerResult
-        )
-        .map(compactMedia)
-
-    result.images = matchedImages
-    result.videos = matchedVideos
-
-    for (const image of matchedImages) {
-      if (image.path) {
-        imageSigningPaths.push(
-          image.path
-        )
-      }
-    }
-  }
-
-  const uniqueImagePaths =
-    unique(imageSigningPaths)
-      .slice(
-        0,
-        CONFIG.maxImageSignedUrls
-      )
-
-  const signedImageEntries =
-    await Promise.all(
-      uniqueImagePaths.map(
-        async path => [
-          path,
-          await createSignedUrl(
-            env,
-            "images",
-            path,
-            CONFIG.signedUrlExpires,
-            signal
-          )
-        ] as const
-      )
-    )
-
-  const signedImages =
-    new Map(
-      signedImageEntries
-        .filter(
-          ([, value]) =>
-            Boolean(value)
-        ) as [
-          string,
-          string
-        ][]
-    )
-
-  const videoThumbnailPaths =
-    unique(
-      results.flatMap(
-        result =>
-          result.videos
-            .map(
-              video =>
-                video.thumbnail_path
-            )
-            .filter(
-              (
-                path
-              ): path is string =>
-                Boolean(path)
-            )
-      )
-    )
-
-  const signedVideoEntries =
-    await Promise.all(
-      videoThumbnailPaths.map(
-        async path => [
-          path,
-          await createSignedUrl(
-            env,
-            "videos",
-            path,
-            CONFIG.signedUrlExpires,
-            signal
-          )
-        ] as const
-      )
-    )
-
-  const signedVideos =
-    new Map(
-      signedVideoEntries
-        .filter(
-          ([, value]) =>
-            Boolean(value)
-        ) as [
-          string,
-          string
-        ][]
-    )
-
-  for (const result of results) {
-    for (const image of result.images) {
-      if (
-        image.path &&
-        signedImages.has(image.path)
-      ) {
-        image.url =
-          signedImages.get(
-            image.path
-          )!
-      }
-    }
-
-    for (const video of result.videos) {
-      if (
-        video.thumbnail_path &&
-        signedVideos.has(
-          video.thumbnail_path
-        )
-      ) {
-        video.thumbnail =
-          signedVideos.get(
-            video.thumbnail_path
-          )!
-      }
-    }
-  }
-}
-
-function sortResults(
-  results: SearchResult[]
-): SearchResult[] {
-  return results.sort(
-    (a, b) =>
-      b.score - a.score
-  )
-}
-
-async function search(
-  env: Env,
-  query: string,
-  signal?: AbortSignal
-): Promise<SearchResult[]> {
-  const normalizedQuery =
-    query.trim().toLowerCase()
-
-  if (!normalizedQuery) {
-    return []
-  }
-
-  const queryTerms =
-    unique(
-      tokenize(normalizedQuery)
-    )
-
-  if (!queryTerms.length) {
-    return []
-  }
-
-  const release =
-    await loadCurrentRelease(
-      env,
-      signal
-    )
-
-  const manifest =
-    await loadManifest(
-      env,
-      release,
-      signal
-    )
-
-  const dictionary =
-    await loadTermEntries(
-      env,
-      manifest,
-      queryTerms,
-      signal
-    )
-
-  const postingMap =
-    new Map<
-      number,
-      Map<string, Posting>
-    >()
-
-  const candidateIds =
-    new Set<number>()
-
-  for (const term of queryTerms) {
-    const entry =
-      dictionary.get(term)
-
-    if (!entry) {
-      continue
-    }
-
-    const postings =
-      getPostings(entry)
-
-    for (const posting of postings) {
-      const id =
-        getPostingId(posting)
-
-      if (
-        id < 0 ||
-        !Number.isFinite(id)
-      ) {
-        continue
-      }
-
-      if (
-        !postingMap.has(id)
-      ) {
-        postingMap.set(
-          id,
-          new Map()
-        )
-      }
-
-      postingMap
-        .get(id)!
-        .set(
-          term,
-          posting
-        )
-
-      if (
-        candidateIds.size <
-        CONFIG.maxDocumentIds
-      ) {
-        candidateIds.add(id)
-      }
-    }
-  }
-
-  if (!candidateIds.size) {
-    return []
-  }
-
-  const documents =
-    await loadDocuments(
-      env,
-      manifest,
-      [...candidateIds],
-      signal
-    )
-
-  const results: SearchResult[] = []
-
-  for (const id of candidateIds) {
-    const document =
-      documents.get(id)
-
-    if (!document) {
-      continue
-    }
-
-    const score =
-      scoreDocument(
-        document,
-        normalizedQuery,
-        queryTerms,
-        dictionary,
-        postingMap
-      )
-
-    results.push({
-      id: document.id,
-      url: document.url,
-      title:
-        document.title || "",
-      description:
-        document.description || "",
-      score,
-      images: [],
-      videos: []
-    })
-  }
-
-  sortResults(results)
-
-  const limitedResults =
-    results.slice(
-      0,
-      CONFIG.maxSearchResults
-    )
-
-  await attachMedia(
-    env,
-    manifest,
-    limitedResults,
-    signal
-  )
-
-  return limitedResults
-}
+/* =========================================================
+   CORS / RESPONSES
+   ========================================================= */
 
 function jsonResponse(
   data: unknown,
@@ -1643,69 +196,1955 @@ function jsonResponse(
     {
       status,
       headers: {
+        ...CORS_HEADERS,
         "Content-Type":
-          "application/json; charset=utf-8",
-        "Cache-Control":
-          "no-store"
+          "application/json; charset=utf-8"
       }
     }
   )
 }
 
-async function handleSearch(
-  request: Request,
+/* =========================================================
+   SUPABASE STORAGE
+   ========================================================= */
+
+function storageUrl(
   env: Env,
-  deadline: number,
+  path: string
+): string {
+  return (
+    `${env.SUPABASE_URL}` +
+    `/storage/v1/object/authenticated/seendex/` +
+    path.replace(/^\/+/, "")
+  )
+}
+
+function supabaseHeaders(
+  env: Env
+): HeadersInit {
+  return {
+    Authorization:
+      `Bearer ${env.SUPABASE_SECRET_KEY}`,
+
+    apikey:
+      env.SUPABASE_SECRET_KEY
+  }
+}
+
+/* =========================================================
+   GZIP STORAGE
+   ========================================================= */
+
+async function fetchGzipText(
+  env: Env,
+  path: string,
+  timeoutMs = SEARCH_TIMEOUT_MS
+): Promise<string> {
+  const response =
+    await fetchWithTimeout(
+      storageUrl(
+        env,
+        path
+      ),
+      {
+        headers:
+          supabaseHeaders(env)
+      },
+      timeoutMs
+    )
+
+  if (!response.ok) {
+    const body =
+      await response.text()
+
+    throw new Error(
+      `Supabase gzip request failed: ` +
+      `${response.status} ` +
+      `${response.statusText} | ` +
+      `${path} | ` +
+      `${body.slice(0, 500)}`
+    )
+  }
+
+  const bytes =
+    Buffer.from(
+      await response.arrayBuffer()
+    )
+
+  const decompressed =
+    await gunzipAsync(bytes)
+
+  return decompressed.toString(
+    "utf8"
+  )
+}
+
+async function fetchJson(
+  env: Env,
+  path: string,
+  timeoutMs = SEARCH_TIMEOUT_MS
+): Promise<any> {
+  const response =
+    await fetchWithTimeout(
+      storageUrl(
+        env,
+        path
+      ),
+      {
+        headers:
+          supabaseHeaders(env)
+      },
+      timeoutMs
+    )
+
+  if (!response.ok) {
+    const body =
+      await response.text()
+
+    throw new Error(
+      `Supabase request failed: ` +
+      `${response.status} ` +
+      `${response.statusText} | ` +
+      `${path} | ` +
+      `${body.slice(0, 500)}`
+    )
+  }
+
+  return response.json()
+}
+
+function parseJsonOrJsonl(
+  text: string
+): any {
+  const trimmed =
+    text.trim()
+
+  if (!trimmed) {
+    return null
+  }
+
+  try {
+    return JSON.parse(
+      trimmed
+    )
+  } catch {
+    const lines =
+      trimmed
+        .split(/\r?\n/)
+        .map(
+          line =>
+            line.trim()
+        )
+        .filter(Boolean)
+
+    return lines.map(
+      line =>
+        JSON.parse(line)
+    )
+  }
+}
+
+async function fetchGzipJson(
+  env: Env,
+  path: string,
+  timeoutMs = SEARCH_TIMEOUT_MS
+): Promise<any> {
+  const text =
+    await fetchGzipText(
+      env,
+      path,
+      timeoutMs
+    )
+
+  return parseJsonOrJsonl(
+    text
+  )
+}
+
+function releasePath(
+  version: string,
+  path: string
+): string {
+  if (
+    path.startsWith(
+      "releases/"
+    )
+  ) {
+    return path
+  }
+
+  return `${version}/${path}`
+}
+
+/* =========================================================
+   GENERIC CONCURRENCY
+   ========================================================= */
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (
+    item: T,
+    index: number
+  ) => Promise<R>
+): Promise<R[]> {
+  if (
+    items.length === 0
+  ) {
+    return []
+  }
+
+  const results =
+    new Array<R>(
+      items.length
+    )
+
+  let cursor = 0
+
+  async function runner() {
+    while (true) {
+      const index =
+        cursor++
+
+      if (
+        index >=
+        items.length
+      ) {
+        return
+      }
+
+      results[index] =
+        await worker(
+          items[index],
+          index
+        )
+    }
+  }
+
+  const workers =
+    Math.min(
+      Math.max(
+        1,
+        concurrency
+      ),
+      items.length
+    )
+
+  await Promise.all(
+    Array.from(
+      {
+        length:
+          workers
+      },
+      () =>
+        runner()
+    )
+  )
+
+  return results
+}
+
+/* =========================================================
+   SIGNED URLS
+   ========================================================= */
+
+async function createSignedUrls(
+  env: Env,
+  bucket: string,
+  paths: string[]
+): Promise<
+  Map<string, string>
+> {
+  const uniquePaths =
+    [
+      ...new Set(
+        paths.filter(Boolean)
+      )
+    ]
+
+  if (
+    uniquePaths.length ===
+    0
+  ) {
+    return new Map()
+  }
+
+  const batches: string[][] =
+    []
+
+  for (
+    let index = 0;
+    index <
+      uniquePaths.length;
+    index += 100
+  ) {
+    batches.push(
+      uniquePaths.slice(
+        index,
+        index + 100
+      )
+    )
+  }
+
+  const url =
+    `${env.SUPABASE_URL}` +
+    `/storage/v1/object/sign/${bucket}`
+
+  const results =
+    await mapConcurrent(
+      batches,
+      SIGNED_URL_CONCURRENCY,
+      async batch => {
+        try {
+          const response =
+            await fetchWithTimeout(
+              url,
+              {
+                method:
+                  "POST",
+
+                headers: {
+                  ...supabaseHeaders(
+                    env
+                  ),
+
+                  "Content-Type":
+                    "application/json"
+                },
+
+                body:
+                  JSON.stringify({
+                    expiresIn:
+                      SIGNED_URL_EXPIRES,
+
+                    paths:
+                      batch
+                  })
+              },
+              MEDIA_TIMEOUT_MS
+            )
+
+          if (
+            !response.ok
+          ) {
+            return []
+          }
+
+          const data =
+            await response.json() as Array<{
+              path?: string
+              signedURL?: string
+              error?: string
+            }>
+
+          return data
+        } catch {
+          return []
+        }
+      }
+    )
+
+  const output =
+    new Map<
+      string,
+      string
+    >()
+
+  for (
+    const batch of results
+  ) {
+    for (
+      const item of batch
+    ) {
+      if (
+        !item.path ||
+        !item.signedURL
+      ) {
+        continue
+      }
+
+      const signedURL =
+        item.signedURL.startsWith(
+          "http://"
+        ) ||
+        item.signedURL.startsWith(
+          "https://"
+        )
+          ? item.signedURL
+          : `${env.SUPABASE_URL}` +
+            `/storage/v1${item.signedURL}`
+
+      output.set(
+        item.path,
+        signedURL
+      )
+    }
+  }
+
+  return output
+}
+
+/* =========================================================
+   TOKENIZATION
+   ========================================================= */
+
+function tokenize(
+  query: string
+): string[] {
+  return query
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(
+      /[^\p{L}\p{N}]+/gu,
+      " "
+    )
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+}
+
+function detectDictionaryQuery(
+  query: string
+): {
+  word: string | null
+  dictionaryOnly: boolean
+} {
+  const normalized =
+    query
+      .trim()
+      .toLowerCase()
+
+  const meaningOf =
+    normalized.match(
+      /^meaning\s+of\s+(.+)$/
+    )
+
+  if (
+    meaningOf
+  ) {
+    return {
+      word:
+        meaningOf[1].trim(),
+
+      dictionaryOnly:
+        true
+    }
+  }
+
+  const trailingMeaning =
+    normalized.match(
+      /^(.+?)\s+meaning$/
+    )
+
+  if (
+    trailingMeaning
+  ) {
+    return {
+      word:
+        trailingMeaning[1].trim(),
+
+      dictionaryOnly:
+        true
+    }
+  }
+
+  const tokens =
+    tokenize(query)
+
+  if (
+    tokens.length === 1
+  ) {
+    return {
+      word:
+        tokens[0],
+
+      dictionaryOnly:
+        false
+    }
+  }
+
+  return {
+    word: null,
+    dictionaryOnly:
+      false
+  }
+}
+
+/* =========================================================
+   DICTIONARY
+   ========================================================= */
+
+async function getDictionary(
+  word: string
+): Promise<any> {
+  try {
+    const url =
+      `https://en.wiktionary.org/api/rest_v1/page/definition/` +
+      encodeURIComponent(
+        word
+      )
+
+    const response =
+      await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            Accept:
+              "application/json"
+          }
+        },
+        5000
+      )
+
+    if (
+      !response.ok
+    ) {
+      return null
+    }
+
+    return response.json()
+  } catch {
+    return null
+  }
+}
+
+/* =========================================================
+   RELEASE / MANIFEST
+   ========================================================= */
+
+async function loadCurrentRelease(
+  env: Env
+): Promise<CurrentRelease> {
+  const current =
+    await fetchGzipJson(
+      env,
+      "current.json"
+    )
+
+  if (
+    !current ||
+    typeof current !==
+      "object"
+  ) {
+    throw new Error(
+      "Invalid current.json"
+    )
+  }
+
+  if (
+    typeof current.version !==
+      "string" ||
+    typeof current.manifest !==
+      "string"
+  ) {
+    throw new Error(
+      "current.json is missing version or manifest"
+    )
+  }
+
+  return current as CurrentRelease
+}
+
+async function loadManifest(
+  env: Env,
+  current: CurrentRelease
+): Promise<Manifest> {
+  const path =
+    releasePath(
+      current.version,
+      current.manifest
+    )
+
+  const manifest =
+    await fetchGzipJson(
+      env,
+      path
+    )
+
+  if (
+    !manifest ||
+    typeof manifest !==
+      "object"
+  ) {
+    throw new Error(
+      "Invalid manifest"
+    )
+  }
+
+  if (
+    !Array.isArray(
+      manifest.docs_shards
+    ) ||
+    !Array.isArray(
+      manifest.term_shards
+    )
+  ) {
+    throw new Error(
+      "Manifest is missing docs_shards or term_shards"
+    )
+  }
+
+  return manifest as Manifest
+}
+
+/* =========================================================
+   TERM SHARDS
+   ========================================================= */
+
+function normalizeTermShard(
+  data: any
+): Map<
+  string,
+  TermEntry[]
+> {
+  const result =
+    new Map<
+      string,
+      TermEntry[]
+    >()
+
+  if (
+    data &&
+    typeof data ===
+      "object" &&
+    !Array.isArray(data)
+  ) {
+    for (
+      const [
+        term,
+        entries
+      ] of Object.entries(data)
+    ) {
+      if (
+        Array.isArray(
+          entries
+        )
+      ) {
+        result.set(
+          term.toLowerCase(),
+
+          entries
+            .filter(
+              entry =>
+                entry &&
+                typeof entry ===
+                  "object"
+            )
+            .map(
+              entry => {
+                const value =
+                  entry as any
+
+                return {
+                  ...value,
+
+                  id:
+                    String(
+                      value.id
+                    ),
+
+                  tf:
+                    Number(
+                      value.tf ||
+                        0
+                    ),
+
+                  title:
+                    value.title !==
+                    undefined
+                      ? Number(
+                          value.title
+                        )
+                      : 0
+                }
+              }
+            )
+        )
+      }
+    }
+
+    return result
+  }
+
+  if (
+    Array.isArray(data)
+  ) {
+    for (
+      const item of data
+    ) {
+      if (
+        !item ||
+        typeof item !==
+          "object" ||
+        typeof item.term !==
+          "string" ||
+        !Array.isArray(
+          item.entries
+        )
+      ) {
+        continue
+      }
+
+      result.set(
+        item.term.toLowerCase(),
+
+        item.entries
+          .filter(
+            (entry: any) =>
+              entry &&
+              typeof entry ===
+                "object"
+          )
+          .map(
+            (entry: any) => ({
+              ...entry,
+
+              id:
+                String(
+                  entry.id
+                ),
+
+              tf:
+                Number(
+                  entry.tf ||
+                    0
+                ),
+
+              title:
+                entry.title !==
+                undefined
+                  ? Number(
+                      entry.title
+                    )
+                  : 0
+            })
+          )
+      )
+    }
+  }
+
+  return result
+}
+
+async function getTermEntries(
+  env: Env,
+  manifest: Manifest,
+  current: CurrentRelease,
+  terms: string[]
+): Promise<
+  Map<string, TermEntry[]>
+> {
+  const wanted =
+    new Set(
+      terms.map(
+        term =>
+          term.toLowerCase()
+      )
+    )
+
+  const found =
+    new Map<
+      string,
+      TermEntry[]
+    >()
+
+  const shardNames =
+    manifest.term_shards.slice(
+      0,
+      Math.min(
+        manifest.term_shards.length,
+        MAX_TERM_SHARDS_PER_SEARCH
+      )
+    )
+
+  await mapConcurrent(
+    shardNames,
+    TERM_SHARD_CONCURRENCY,
+    async shardName => {
+      if (
+        found.size ===
+        wanted.size
+      ) {
+        return
+      }
+
+      try {
+        const path =
+          releasePath(
+            current.version,
+            shardName
+          )
+
+        const data =
+          await fetchGzipJson(
+            env,
+            path,
+            SEARCH_TIMEOUT_MS
+          )
+
+        const entries =
+          normalizeTermShard(
+            data
+          )
+
+        for (
+          const term of wanted
+        ) {
+          if (
+            found.has(term)
+          ) {
+            continue
+          }
+
+          const value =
+            entries.get(
+              term
+            )
+
+          if (
+            value
+          ) {
+            found.set(
+              term,
+              value
+            )
+          }
+        }
+      } catch {
+      }
+    }
+  )
+
+  return found
+}
+
+/* =========================================================
+   DOCUMENT SHARDS
+   ========================================================= */
+
+function normalizeDocuments(
+  data: any
+): Document[] {
+  let documents: any[] =
+    []
+
+  if (
+    Array.isArray(data)
+  ) {
+    documents =
+      data
+  } else if (
+    data &&
+    typeof data ===
+      "object"
+  ) {
+    if (
+      Array.isArray(
+        data.documents
+      )
+    ) {
+      documents =
+        data.documents
+    } else if (
+      data.id !==
+      undefined
+    ) {
+      documents = [
+        data
+      ]
+    }
+  }
+
+  return documents
+    .filter(
+      item =>
+        item &&
+        typeof item ===
+          "object" &&
+        item.id !==
+          undefined
+    )
+    .map(
+      item => ({
+        ...item,
+
+        id:
+          Number(
+            item.id
+          ),
+
+        url:
+          String(
+            item.url ||
+              ""
+          ),
+
+        title:
+          String(
+            item.title ||
+              ""
+          ),
+
+        description:
+          String(
+            item.description ||
+              ""
+          ),
+
+        text:
+          String(
+            item.text ||
+              ""
+          )
+      })
+    )
+    .filter(
+      item =>
+        Number.isInteger(
+          item.id
+        ) &&
+        item.url.length >
+          0
+    ) as Document[]
+}
+
+async function getDocuments(
+  env: Env,
+  manifest: Manifest,
+  current: CurrentRelease,
+  ids: number[]
+): Promise<Document[]> {
+  if (
+    ids.length === 0
+  ) {
+    return []
+  }
+
+  const requestedIds =
+    new Set(
+      ids.slice(
+        0,
+        MAX_DOCUMENT_IDS
+      )
+    )
+
+  const shardIds =
+    [
+      ...requestedIds
+    ].map(
+      id =>
+        Math.floor(
+          id / 250
+        )
+    )
+
+  const uniqueShardIds =
+    [
+      ...new Set(
+        shardIds
+      )
+    ]
+
+  const limitedShardIds =
+    uniqueShardIds.slice(
+      0,
+      MAX_DOCUMENT_SHARDS_PER_SEARCH
+    )
+
+  const documents =
+    new Map<
+      number,
+      Document
+    >()
+
+  await mapConcurrent(
+    limitedShardIds,
+    DOCUMENT_SHARD_CONCURRENCY,
+    async shardId => {
+      if (
+        documents.size ===
+        requestedIds.size
+      ) {
+        return
+      }
+
+      const shardName =
+        manifest
+          .docs_shards[
+            shardId
+          ]
+
+      if (
+        !shardName
+      ) {
+        return
+      }
+
+      try {
+        const path =
+          releasePath(
+            current.version,
+            shardName
+          )
+
+        const data =
+          await fetchGzipJson(
+            env,
+            path,
+            SEARCH_TIMEOUT_MS
+          )
+
+        const shardDocuments =
+          normalizeDocuments(
+            data
+          )
+
+        for (
+          const document
+          of shardDocuments
+        ) {
+          if (
+            requestedIds.has(
+              document.id
+            )
+          ) {
+            documents.set(
+              document.id,
+              document
+            )
+          }
+        }
+      } catch {
+      }
+    }
+  )
+
+  return [
+    ...requestedIds
+  ]
+    .map(
+      id =>
+        documents.get(id)
+    )
+    .filter(
+      (
+        document
+      ): document is Document =>
+        Boolean(document)
+    )
+}
+
+/* =========================================================
+   TRUTH25
+   ========================================================= */
+
+function truth25(
+  document: Document,
+  query: string,
+  terms: string[],
+  entries: Map<
+    string,
+    TermEntry[]
+  >
+): number {
+  const title =
+    document.title
+      .toLowerCase()
+
+  const description =
+    document.description
+      .toLowerCase()
+
+  const text =
+    document.text
+      .toLowerCase()
+
+  const url =
+    document.url
+      .toLowerCase()
+
+  const normalizedQuery =
+    query.toLowerCase()
+
+  let score = 0
+
+  for (
+    const term of terms
+  ) {
+    if (
+      title.includes(term)
+    ) {
+      score += 25
+    }
+
+    if (
+      description.includes(
+        term
+      )
+    ) {
+      score += 8
+    }
+
+    if (
+      text.includes(term)
+    ) {
+      score += 3
+    }
+
+    if (
+      url.includes(term)
+    ) {
+      score += 5
+    }
+
+    const termEntries =
+      entries.get(term)
+
+    if (
+      termEntries
+    ) {
+      for (
+        const entry
+        of termEntries
+      ) {
+        if (
+          Number(entry.id) ===
+          document.id
+        ) {
+          score +=
+            Number(
+              entry.tf || 0
+            ) * 2
+
+          score +=
+            Number(
+              entry.title || 0
+            ) * 8
+
+          break
+        }
+      }
+    }
+  }
+
+  if (
+    title.includes(
+      normalizedQuery
+    )
+  ) {
+    score += 25
+  }
+
+  score += Math.min(
+    5,
+    document.text.length /
+      10000
+  )
+
+  return score
+}
+
+/* =========================================================
+   MEDIA
+   ========================================================= */
+
+function normalizeMedia(
+  data: any
+): any[] {
+  if (
+    Array.isArray(data)
+  ) {
+    return data
+  }
+
+  if (
+    data &&
+    typeof data ===
+      "object"
+  ) {
+    for (
+      const key of [
+        "items",
+        "media",
+        "images",
+        "videos"
+      ]
+    ) {
+      if (
+        Array.isArray(
+          data[key]
+        )
+      ) {
+        return data[key]
+      }
+    }
+  }
+
+  return []
+}
+
+function normalizeUrl(
+  value: unknown
+): string {
+  if (
+    typeof value !==
+    "string"
+  ) {
+    return ""
+  }
+
+  try {
+    const url =
+      new URL(value)
+
+    url.hash = ""
+
+    if (
+      url.pathname.length >
+        1 &&
+      url.pathname.endsWith(
+        "/"
+      )
+    ) {
+      url.pathname =
+        url.pathname.slice(
+          0,
+          -1
+        )
+    }
+
+    return url
+      .toString()
+      .toLowerCase()
+  } catch {
+    return value
+      .trim()
+      .replace(
+        /#.*$/,
+        ""
+      )
+      .replace(
+        /\/+$/,
+        ""
+      )
+      .toLowerCase()
+  }
+}
+
+function getMediaPageUrl(
+  item: any
+): string {
+  for (
+    const key of [
+      "page_url",
+      "source_url",
+      "source",
+      "document_url",
+      "documentUrl",
+      "parent_url",
+      "parentUrl",
+      "origin_url",
+      "originUrl",
+      "page",
+      "source_page",
+      "sourcePage"
+    ]
+  ) {
+    if (
+      typeof item?.[
+        key
+      ] === "string"
+    ) {
+      return item[key]
+    }
+  }
+
+  return ""
+}
+
+function mediaMatchesDocument(
+  item: any,
+  documentUrl: string
+): boolean {
+  const target =
+    normalizeUrl(
+      documentUrl
+    )
+
+  const mediaPage =
+    normalizeUrl(
+      getMediaPageUrl(
+        item
+      )
+    )
+
+  if (
+    mediaPage &&
+    mediaPage === target
+  ) {
+    return true
+  }
+
+  const mediaUrl =
+    normalizeUrl(
+      item?.url
+    )
+
+  if (
+    mediaUrl &&
+    mediaUrl === target
+  ) {
+    return true
+  }
+
+  return false
+}
+
+function compactMedia(
+  item: any
+): MediaItem {
+  const result:
+    MediaItem = {}
+
+  if (
+    typeof item.url ===
+      "string"
+  ) {
+    result.url =
+      item.url
+  }
+
+  if (
+    typeof item.path ===
+      "string"
+  ) {
+    result.path =
+      item.path
+  }
+
+  if (
+    typeof item.title ===
+      "string"
+  ) {
+    result.title =
+      item.title
+  }
+
+  if (
+    typeof item.alt ===
+      "string"
+  ) {
+    result.alt =
+      item.alt
+  }
+
+  if (
+    typeof item.type ===
+      "string"
+  ) {
+    result.type =
+      item.type
+  }
+
+  if (
+    typeof item.mime_type ===
+      "string"
+  ) {
+    result.mime_type =
+      item.mime_type
+  }
+
+  if (
+    typeof item.thumbnail ===
+      "string"
+  ) {
+    result.thumbnail =
+      item.thumbnail
+  }
+
+  if (
+    typeof item.thumbnail_path ===
+      "string"
+  ) {
+    result.thumbnail_path =
+      item.thumbnail_path
+  }
+
+  return result
+}
+
+/* =========================================================
+   MEDIA MANIFEST LOADING
+   ========================================================= */
+
+async function loadMediaFile(
+  env: Env,
+  current: CurrentRelease,
+  path: string
+): Promise<any[]> {
+  try {
+    const data =
+      await fetchGzipJson(
+        env,
+        releasePath(
+          current.version,
+          path
+        ),
+        MEDIA_TIMEOUT_MS
+      )
+
+    return normalizeMedia(
+      data
+    )
+  } catch {
+    return []
+  }
+}
+
+async function loadMediaCollection(
+  env: Env,
+  current: CurrentRelease,
+  path?: string
+): Promise<any[]> {
+  if (
+    !path
+  ) {
+    return []
+  }
+
+  return loadMediaFile(
+    env,
+    current,
+    path
+  )
+}
+
+/* =========================================================
+   ATTACH MEDIA
+   ========================================================= */
+
+async function attachMedia(
+  env: Env,
+  manifest: Manifest,
+  current: CurrentRelease,
+  results: SearchResult[]
+): Promise<void> {
+  if (
+    results.length === 0
+  ) {
+    return
+  }
+
+  const [
+    images,
+    videos
+  ] =
+    await Promise.all([
+      loadMediaCollection(
+        env,
+        current,
+        manifest.images
+      ),
+
+      loadMediaCollection(
+        env,
+        current,
+        manifest.videos
+      )
+    ])
+
+  const imagePaths:
+    string[] = []
+
+  const videoThumbnailPaths:
+    string[] = []
+
+  for (
+    const result of results
+  ) {
+    const matchedImages =
+      images
+        .filter(
+          image =>
+            mediaMatchesDocument(
+              image,
+              result.url
+            )
+        )
+        .slice(
+          0,
+          MAX_IMAGES_PER_RESULT
+        )
+
+    const matchedVideos =
+      videos
+        .filter(
+          video =>
+            mediaMatchesDocument(
+              video,
+              result.url
+            )
+        )
+        .slice(
+          0,
+          MAX_VIDEOS_PER_RESULT
+        )
+
+    result.images =
+      matchedImages.map(
+        compactMedia
+      )
+
+    result.videos =
+      matchedVideos.map(
+        compactMedia
+      )
+
+    for (
+      const image
+      of result.images
+    ) {
+      if (
+        image.path
+      ) {
+        imagePaths.push(
+          image.path
+        )
+      }
+    }
+
+    for (
+      const video
+      of result.videos
+    ) {
+      if (
+        video.thumbnail_path
+      ) {
+        videoThumbnailPaths.push(
+          video.thumbnail_path
+        )
+      }
+    }
+  }
+
+  const uniqueImagePaths =
+    [
+      ...new Set(
+        imagePaths
+      )
+    ].slice(
+      0,
+      MAX_IMAGE_SIGNED_URLS
+    )
+
+  const uniqueVideoPaths =
+    [
+      ...new Set(
+        videoThumbnailPaths
+      )
+    ].slice(
+      0,
+      MAX_VIDEO_SIGNED_URLS
+    )
+
+  const [
+    imageSignedUrls,
+    videoSignedUrls
+  ] =
+    await Promise.all([
+      createSignedUrls(
+        env,
+        "images",
+        uniqueImagePaths
+      ),
+
+      createSignedUrls(
+        env,
+        "videos",
+        uniqueVideoPaths
+      )
+    ])
+
+  for (
+    const result of results
+  ) {
+    for (
+      const image
+      of result.images
+    ) {
+      if (
+        image.path &&
+        imageSignedUrls.has(
+          image.path
+        )
+      ) {
+        image.url =
+          imageSignedUrls.get(
+            image.path
+          )
+      }
+    }
+
+    for (
+      const video
+      of result.videos
+    ) {
+      if (
+        video.thumbnail_path &&
+        videoSignedUrls.has(
+          video.thumbnail_path
+        )
+      ) {
+        video.thumbnail =
+          videoSignedUrls.get(
+            video.thumbnail_path
+          )
+      }
+    }
+  }
+}
+
+/* =========================================================
+   SEARCH
+   ========================================================= */
+
+async function performSearch(
+  env: Env,
+  query: string,
   signal?: AbortSignal
+): Promise<{
+  results: SearchResult[]
+  dictionary: any
+}> {
+  const terms =
+    tokenize(query)
+
+  if (
+    terms.length === 0
+  ) {
+    return {
+      results: [],
+      dictionary: null
+    }
+  }
+
+  const dictionaryQuery =
+    detectDictionaryQuery(
+      query
+    )
+
+  if (
+    dictionaryQuery.dictionaryOnly &&
+    dictionaryQuery.word
+  ) {
+    return {
+      results: [],
+      dictionary:
+        await getDictionary(
+          dictionaryQuery.word
+        )
+    }
+  }
+
+  const current =
+    await loadCurrentRelease(
+      env
+    )
+
+  const manifest =
+    await loadManifest(
+      env,
+      current
+    )
+
+  const termEntries =
+    await getTermEntries(
+      env,
+      manifest,
+      current,
+      terms
+    )
+
+  if (
+    termEntries.size ===
+    0
+  ) {
+    return {
+      results: [],
+      dictionary: null
+    }
+  }
+
+  const documentIds =
+    new Set<number>()
+
+  for (
+    const entries
+    of termEntries.values()
+  ) {
+    for (
+      const entry
+      of entries
+    ) {
+      const id =
+        Number(entry.id)
+
+      if (
+        !Number.isInteger(
+          id
+        ) ||
+        id < 0
+      ) {
+        continue
+      }
+
+      documentIds.add(id)
+
+      if (
+        documentIds.size >=
+        MAX_DOCUMENT_IDS
+      ) {
+        break
+      }
+    }
+
+    if (
+      documentIds.size >=
+      MAX_DOCUMENT_IDS
+    ) {
+      break
+    }
+  }
+
+  if (
+    documentIds.size ===
+    0
+  ) {
+    return {
+      results: [],
+      dictionary: null
+    }
+  }
+
+  const documents =
+    await getDocuments(
+      env,
+      manifest,
+      current,
+      [
+        ...documentIds
+      ]
+    )
+
+  const scored =
+    documents
+      .map(
+        document => ({
+          document,
+
+          score:
+            truth25(
+              document,
+              query,
+              terms,
+              termEntries
+            )
+        })
+      )
+      .filter(
+        item =>
+          item.score > 0
+      )
+      .sort(
+        (a, b) =>
+          b.score -
+          a.score
+      )
+      .slice(
+        0,
+        MAX_SEARCH_RESULTS
+      )
+
+  const results =
+    scored.map(
+      item => ({
+        id:
+          item.document.id,
+
+        url:
+          item.document.url,
+
+        title:
+          item.document.title,
+
+        description:
+          item.document.description,
+
+        score:
+          item.score,
+
+        images: [],
+
+        videos: []
+      })
+    )
+
+  if (
+    results.length > 0
+  ) {
+    await attachMedia(
+      env,
+      manifest,
+      current,
+      results
+    )
+  }
+
+  let dictionary =
+    null
+
+  if (
+    dictionaryQuery.word
+  ) {
+    dictionary =
+      await getDictionary(
+        dictionaryQuery.word
+      )
+  }
+
+  return {
+    results,
+    dictionary
+  }
+}
+
+/* =========================================================
+   REQUEST HANDLER
+   ========================================================= */
+
+async function handleRequest(
+  request: Request
 ): Promise<Response> {
   const url =
-    new URL(request.url)
+    new URL(
+      request.url
+    )
 
-  const query =
-    url.searchParams.get("q") ||
-    url.searchParams.get("query") ||
-    ""
+  if (
+    request.method ===
+    "OPTIONS"
+  ) {
+    return new Response(
+      null,
+      {
+        status: 204,
+        headers:
+          CORS_HEADERS
+      }
+    )
+  }
 
-  if (!query.trim()) {
+  if (
+    request.method !==
+    "GET"
+  ) {
     return jsonResponse(
       {
-        query: "",
-        dictionary: null,
-        results: []
+        error:
+          "Method not allowed"
+      },
+      405
+    )
+  }
+
+  if (
+    url.pathname ===
+    "/health"
+  ) {
+    return jsonResponse({
+      ok: true,
+      service:
+        "seerchsqapi",
+      runtime:
+        "render",
+      uptime:
+        process.uptime()
+    })
+  }
+
+  if (
+    url.pathname !==
+    "/search"
+  ) {
+    return jsonResponse(
+      {
+        error:
+          "Not found"
+      },
+      404
+    )
+  }
+
+  const query =
+    url.searchParams
+      .get("q")
+      ?.trim() || ""
+
+  if (!query) {
+    return jsonResponse(
+      {
+        error:
+          "Missing query parameter"
       },
       400
     )
   }
 
-  if (
-    Date.now() >= deadline
-  ) {
-    return jsonResponse(
-      {
-        error: "Request timeout"
+  const controller =
+    new AbortController()
+
+  const timeout =
+    setTimeout(
+      () => {
+        controller.abort()
       },
-      504
+      SEARCH_TIMEOUT_MS
     )
-  }
 
   try {
-    const results =
-      await search(
+    const result =
+      await performSearch(
         env,
         query,
-        signal
+        controller.signal
       )
 
     return jsonResponse({
       query,
-      dictionary: null,
-      results
+
+      dictionary:
+        result.dictionary,
+
+      results:
+        result.results
     })
   } catch (error) {
     console.error(
-      "Search error:",
+      "[search]",
       error
     )
+
+    if (
+      controller.signal.aborted
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "Search request timed out"
+        },
+        504
+      )
+    }
 
     return jsonResponse(
       {
@@ -1716,15 +2155,25 @@ async function handleSearch(
       },
       500
     )
+  } finally {
+    clearTimeout(
+      timeout
+    )
   }
 }
 
-async function handleHttpRequest(
+/* =========================================================
+   NODE ADAPTER
+   ========================================================= */
+
+async function nodeRequestToWebRequest(
   request: http.IncomingMessage
 ): Promise<Request> {
   const protocol =
     (
-      request.headers["x-forwarded-proto"] ||
+      request.headers[
+        "x-forwarded-proto"
+      ] ||
       "http"
     )
       .toString()
@@ -1735,8 +2184,7 @@ async function handleHttpRequest(
     (
       request.headers.host ||
       "localhost"
-    )
-      .toString()
+    ).toString()
 
   const url =
     `${protocol}://${host}${request.url || "/"}`
@@ -1745,13 +2193,21 @@ async function handleHttpRequest(
     new Headers()
 
   for (
-    const [key, value]
+    const [
+      key,
+      value
+    ]
     of Object.entries(
       request.headers
     )
   ) {
-    if (Array.isArray(value)) {
-      for (const item of value) {
+    if (
+      Array.isArray(value)
+    ) {
+      for (
+        const item
+        of value
+      ) {
         headers.append(
           key,
           item
@@ -1767,53 +2223,31 @@ async function handleHttpRequest(
     }
   }
 
-  let body:
-    | Uint8Array
-    | undefined
-
-  if (
-    request.method !== "GET" &&
-    request.method !== "HEAD" &&
-    request.method !== "OPTIONS"
-  ) {
-    const chunks: Buffer[] = []
-
-    for await (
-      const chunk of request
-    ) {
-      chunks.push(
-        Buffer.from(chunk)
-      )
-    }
-
-    body =
-      Buffer.concat(chunks)
-  }
-
   return new Request(
     url,
     {
       method:
-        request.method || "GET",
-      headers,
-      body:
-        body
-          ? new Uint8Array(body)
-          : undefined
+        request.method ||
+        "GET",
+
+      headers
     }
   )
 }
 
-async function sendNodeResponse(
-  nodeResponse: http.ServerResponse,
-  response: Response
+async function sendResponse(
+  response: http.ServerResponse,
+  webResponse: Response
 ): Promise<void> {
-  nodeResponse.statusCode =
-    response.status
+  response.statusCode =
+    webResponse.status
 
-  response.headers.forEach(
-    (value, key) => {
-      nodeResponse.setHeader(
+  webResponse.headers.forEach(
+    (
+      value,
+      key
+    ) => {
+      response.setHeader(
         key,
         value
       )
@@ -1821,219 +2255,137 @@ async function sendNodeResponse(
   )
 
   const body =
-    await response.arrayBuffer()
+    await webResponse.arrayBuffer()
 
-  nodeResponse.end(
+  response.end(
     Buffer.from(body)
   )
 }
 
-async function main(): Promise<void> {
-  const env =
-    loadEnv()
+/* =========================================================
+   SERVER
+   ========================================================= */
 
-  const server =
-    http.createServer(
-      async (
-        nodeRequest,
-        nodeResponse
-      ) => {
-        const started =
-          Date.now()
+const port =
+  Number(
+    process.env.PORT ||
+      10000
+  )
 
-        const controller =
-          new AbortController()
+const server =
+  http.createServer(
+    async (
+      nodeRequest,
+      nodeResponse
+    ) => {
+      const started =
+        Date.now()
 
-        const timeout =
-          setTimeout(
-            () => {
-              controller.abort()
-            },
-            CONFIG.requestTimeoutMs
+      try {
+        const request =
+          await nodeRequestToWebRequest(
+            nodeRequest
           )
 
-        try {
-          const webRequest =
-            await handleHttpRequest(
-              nodeRequest
-            )
+        const response =
+          await handleRequest(
+            request
+          )
 
-          const method =
-            webRequest.method
-              .toUpperCase()
+        await sendResponse(
+          nodeResponse,
+          response
+        )
 
-          if (
-            method === "OPTIONS"
-          ) {
-            const response =
-              new Response(
-                null,
-                {
-                  status: 204,
-                  headers: {
-                    "Access-Control-Allow-Origin":
-                      "*",
-                    "Access-Control-Allow-Methods":
-                      "GET,OPTIONS",
-                    "Access-Control-Allow-Headers":
-                      "Content-Type"
-                  }
-                }
-              )
+        const url =
+          new URL(
+            request.url
+          )
 
-            await sendNodeResponse(
-              nodeResponse,
-              response
-            )
+        console.log(
+          `[request] ${request.method} ` +
+          `${url.pathname}${url.search} ` +
+          `${response.status} ` +
+          `${Date.now() - started}ms`
+        )
+      } catch (error) {
+        console.error(
+          "[server]",
+          error
+        )
 
-            return
-          }
-
-          const url =
-            new URL(
-              webRequest.url
-            )
-
-          if (
-            method === "GET" &&
-            url.pathname ===
-              "/health"
-          ) {
-            const response =
-              jsonResponse({
-                status: "ok",
-                service: "see-api",
-                uptime:
-                  process.uptime()
-              })
-
-            response.headers.set(
-              "Access-Control-Allow-Origin",
-              "*"
-            )
-
-            await sendNodeResponse(
-              nodeResponse,
-              response
-            )
-
-            return
-          }
-
-          if (
-            method === "GET" &&
-            url.pathname ===
-              "/search"
-          ) {
-            const deadline =
-              Date.now() +
-              CONFIG.requestTimeoutMs
-
-            const response =
-              await handleSearch(
-                webRequest,
-                env,
-                deadline,
-                controller.signal
-              )
-
-            response.headers.set(
-              "Access-Control-Allow-Origin",
-              "*"
-            )
-
-            await sendNodeResponse(
-              nodeResponse,
-              response
-            )
-
-            console.log(
-              `${nodeRequest.method} ${url.pathname}${url.search} ` +
-              `${response.status} ` +
-              `${Date.now() - started}ms`
-            )
-
-            return
-          }
-
+        if (
+          !nodeResponse.headersSent
+        ) {
           const response =
             jsonResponse(
               {
                 error:
-                  "Not found"
+                  error instanceof Error
+                    ? error.message
+                    : "Internal server error"
               },
-              404
+              500
             )
 
-          response.headers.set(
-            "Access-Control-Allow-Origin",
-            "*"
-          )
-
-          await sendNodeResponse(
+          await sendResponse(
             nodeResponse,
             response
           )
-        } catch (error) {
-          console.error(
-            "Request error:",
-            error
-          )
-
-          if (
-            !nodeResponse.headersSent
-          ) {
-            const response =
-              jsonResponse(
-                {
-                  error:
-                    error instanceof Error
-                      ? error.message
-                      : "Internal server error"
-                },
-                500
-              )
-
-            response.headers.set(
-              "Access-Control-Allow-Origin",
-              "*"
-            )
-
-            await sendNodeResponse(
-              nodeResponse,
-              response
-            )
-          } else {
-            nodeResponse.end()
-          }
-        } finally {
-          clearTimeout(timeout)
+        } else {
+          nodeResponse.end()
         }
       }
-    )
-
-  const port =
-    Number(
-      process.env.PORT ||
-      10000
-    )
-
-  server.listen(
-    port,
-    "0.0.0.0",
-    () => {
-      console.log(
-        `SEErch² API listening on port ${port}`
-      )
     }
   )
-}
 
-main().catch(error => {
-  console.error(
-    "Fatal startup error:",
-    error
+server.listen(
+  port,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Seendex Remade API listening on port ${port}`
+    )
+  }
+)
+
+/* =========================================================
+   SHUTDOWN
+   ========================================================= */
+
+function shutdown(
+  signal: string
+) {
+  console.log(
+    `[server] received ${signal}, shutting down`
   )
 
-  process.exit(1)
-})
+  server.close(
+    () => {
+      process.exit(0)
+    }
+  )
+
+  setTimeout(
+    () => {
+      process.exit(1)
+    },
+    10000
+  ).unref()
+}
+
+process.on(
+  "SIGTERM",
+  () =>
+    shutdown(
+      "SIGTERM"
+    )
+)
+
+process.on(
+  "SIGINT",
+  () =>
+    shutdown(
+      "SIGINT"
+    )
+)
