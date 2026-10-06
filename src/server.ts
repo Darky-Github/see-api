@@ -63,111 +63,67 @@ interface MediaItem {
   thumbnail_path?: string
 }
 
-const MAX_DOCUMENT_IDS = 1000
-const MAX_SEARCH_RESULTS = 25
-const MAX_IMAGES_PER_RESULT = 4
-const MAX_VIDEOS_PER_RESULT = 2
-const MAX_IMAGE_SIGNED_URLS = 100
-const SIGNED_URL_EXPIRES = 3600
+interface SearchConfig {
+  requestTimeoutMs: number
+  fetchTimeoutMs: number
+  mediaTimeoutMs: number
+  termShardConcurrency: number
+  documentShardConcurrency: number
+  maxDocumentIds: number
+  maxSearchResults: number
+  maxImagesPerResult: number
+  maxVideosPerResult: number
+  maxImageSignedUrls: number
+  signedUrlExpires: number
+}
 
-const MAX_TERM_SHARDS_PER_SEARCH = 128
-const MAX_DOCUMENT_SHARDS_PER_SEARCH = 128
-const MAX_TERM_ENTRY_DOCUMENTS = 1000
-
-const SEARCH_TIMEOUT_MS = 15000
-const MEDIA_TIMEOUT_MS = 4000
-
-const TERM_SHARD_CONCURRENCY = 12
-const DOCUMENT_SHARD_CONCURRENCY = 12
+const CONFIG: SearchConfig = {
+  requestTimeoutMs: 25000,
+  fetchTimeoutMs: 10000,
+  mediaTimeoutMs: 12000,
+  termShardConcurrency: 12,
+  documentShardConcurrency: 12,
+  maxDocumentIds: 1000,
+  maxSearchResults: 25,
+  maxImagesPerResult: 4,
+  maxVideosPerResult: 2,
+  maxImageSignedUrls: 100,
+  signedUrlExpires: 3600
+}
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
   "Access-Control-Max-Age": "86400"
 }
 
 function loadEnv(): Env {
   const SUPABASE_URL =
-    process.env.SUPABASE_URL?.trim()
+    process.env.SUPABASE_URL?.trim() || ""
 
   const SUPABASE_SECRET_KEY =
-    process.env.SUPABASE_SECRET_KEY?.trim()
+    process.env.SUPABASE_SECRET_KEY?.trim() || ""
 
   if (!SUPABASE_URL) {
-    throw new Error(
-      "Missing SUPABASE_URL environment variable"
-    )
+    throw new Error("Missing SUPABASE_URL")
   }
 
   if (!SUPABASE_SECRET_KEY) {
-    throw new Error(
-      "Missing SUPABASE_SECRET_KEY environment variable"
-    )
+    throw new Error("Missing SUPABASE_SECRET_KEY")
   }
 
   return {
-    SUPABASE_URL:
-      SUPABASE_URL.replace(/\/+$/, ""),
+    SUPABASE_URL: SUPABASE_URL.replace(/\/+$/, ""),
     SUPABASE_SECRET_KEY
   }
-}
-
-function withTimeout(
-  signal: AbortSignal | undefined,
-  timeoutMs: number
-): AbortSignal {
-  if (signal) {
-    return AbortSignal.any([
-      signal,
-      AbortSignal.timeout(timeoutMs)
-    ])
-  }
-
-  return AbortSignal.timeout(timeoutMs)
-}
-
-async function fetchWithTimeout(
-  input: RequestInfo | URL,
-  init: RequestInit = {},
-  timeoutMs = SEARCH_TIMEOUT_MS
-): Promise<Response> {
-  return fetch(input, {
-    ...init,
-    signal: withTimeout(
-      init.signal ?? undefined,
-      timeoutMs
-    )
-  })
-}
-
-function jsonResponse(
-  data: unknown,
-  status = 200
-): Response {
-  return new Response(
-    JSON.stringify(data),
-    {
-      status,
-      headers: {
-        ...CORS_HEADERS,
-        "Content-Type":
-          "application/json; charset=utf-8"
-      }
-    }
-  )
 }
 
 function storageUrl(
   env: Env,
   path: string
 ): string {
-  return (
-    `${env.SUPABASE_URL}` +
-    `/storage/v1/object/authenticated/seendex/` +
-    path
-  )
+  return `${env.SUPABASE_URL}/storage/v1/object/authenticated/seendex/${path}`
 }
 
 function supabaseHeaders(
@@ -181,12 +137,128 @@ function supabaseHeaders(
   }
 }
 
+function createAbortController(
+  timeoutMs: number
+): {
+  controller: AbortController
+  timer: NodeJS.Timeout
+} {
+  const controller = new AbortController()
+
+  const timer = setTimeout(() => {
+    controller.abort()
+  }, timeoutMs)
+
+  return {
+    controller,
+    timer
+  }
+}
+
+function remainingTime(
+  deadline: number
+): number {
+  return Math.max(
+    0,
+    deadline - Date.now()
+  )
+}
+
+function effectiveTimeout(
+  deadline: number,
+  preferred: number
+): number {
+  const remaining =
+    remainingTime(deadline)
+
+  if (remaining <= 0) {
+    return 0
+  }
+
+  return Math.min(
+    preferred,
+    Math.max(250, remaining)
+  )
+}
+
+async function fetchWithTimeout(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  if (timeoutMs <= 0) {
+    throw new Error("Request deadline exceeded")
+  }
+
+  const controller =
+    new AbortController()
+
+  const externalSignal =
+    init.signal
+
+  let externalAbortHandler:
+    (() => void) | undefined
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort()
+    } else {
+      externalAbortHandler = () => {
+        controller.abort()
+      }
+
+      externalSignal.addEventListener(
+        "abort",
+        externalAbortHandler,
+        { once: true }
+      )
+    }
+  }
+
+  const timer = setTimeout(() => {
+    controller.abort()
+  }, timeoutMs)
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal
+    })
+  } finally {
+    clearTimeout(timer)
+
+    if (
+      externalSignal &&
+      externalAbortHandler
+    ) {
+      externalSignal.removeEventListener(
+        "abort",
+        externalAbortHandler
+      )
+    }
+  }
+}
+
 async function fetchGzipText(
   env: Env,
   path: string,
-  timeoutMs = SEARCH_TIMEOUT_MS,
-  signal?: AbortSignal
+  deadline: number,
+  signal: AbortSignal,
+  timeoutOverride?: number
 ): Promise<string> {
+  const timeoutMs =
+    effectiveTimeout(
+      deadline,
+      timeoutOverride ??
+        CONFIG.fetchTimeoutMs
+    )
+
+  if (timeoutMs <= 0) {
+    throw new Error(
+      `Request deadline exceeded: ${path}`
+    )
+  }
+
   const response =
     await fetchWithTimeout(
       storageUrl(env, path),
@@ -211,13 +283,13 @@ async function fetchGzipText(
     )
   }
 
-  const bytes =
+  const buffer =
     Buffer.from(
       await response.arrayBuffer()
     )
 
   const decompressed =
-    await gunzipAsync(bytes)
+    await gunzipAsync(buffer)
 
   return decompressed.toString("utf8")
 }
@@ -225,9 +297,21 @@ async function fetchGzipText(
 async function fetchJson(
   env: Env,
   path: string,
-  timeoutMs = SEARCH_TIMEOUT_MS,
-  signal?: AbortSignal
+  deadline: number,
+  signal: AbortSignal
 ): Promise<any> {
+  const timeoutMs =
+    effectiveTimeout(
+      deadline,
+      CONFIG.fetchTimeoutMs
+    )
+
+  if (timeoutMs <= 0) {
+    throw new Error(
+      `Request deadline exceeded: ${path}`
+    )
+  }
+
   const response =
     await fetchWithTimeout(
       storageUrl(env, path),
@@ -271,14 +355,10 @@ function parseJsonOrJsonl(
     const lines =
       trimmed
         .split(/\r?\n/)
-        .map(
-          line =>
-            line.trim()
-        )
+        .map(line => line.trim())
         .filter(Boolean)
 
-    const values: any[] =
-      []
+    const values: any[] = []
 
     for (
       let index = 0;
@@ -287,15 +367,12 @@ function parseJsonOrJsonl(
     ) {
       try {
         values.push(
-          JSON.parse(
-            lines[index]
-          )
+          JSON.parse(lines[index])
         )
       } catch (error) {
         throw new Error(
-          `Invalid JSONL at line ${
-            index + 1
-          }: ${
+          `Invalid JSONL at line ${index + 1}: ` +
+          `${
             error instanceof Error
               ? error.message
               : String(error)
@@ -311,15 +388,17 @@ function parseJsonOrJsonl(
 async function fetchGzipJson(
   env: Env,
   path: string,
-  timeoutMs = SEARCH_TIMEOUT_MS,
-  signal?: AbortSignal
+  deadline: number,
+  signal: AbortSignal,
+  timeoutOverride?: number
 ): Promise<any> {
   const text =
     await fetchGzipText(
       env,
       path,
-      timeoutMs,
-      signal
+      deadline,
+      signal,
+      timeoutOverride
     )
 
   return parseJsonOrJsonl(text)
@@ -341,7 +420,9 @@ function releasePath(
 async function createSignedUrls(
   env: Env,
   bucket: string,
-  paths: string[]
+  paths: string[],
+  deadline: number,
+  signal: AbortSignal
 ): Promise<Map<string, string>> {
   const uniquePaths = [
     ...new Set(
@@ -355,9 +436,20 @@ async function createSignedUrls(
     return new Map()
   }
 
+  const timeoutMs =
+    effectiveTimeout(
+      deadline,
+      CONFIG.fetchTimeoutMs
+    )
+
+  if (timeoutMs <= 0) {
+    return new Map()
+  }
+
   const url =
     `${env.SUPABASE_URL}` +
-    `/storage/v1/object/sign/${bucket}`
+    `/storage/v1/object/sign/` +
+    bucket
 
   const response =
     await fetchWithTimeout(
@@ -371,12 +463,12 @@ async function createSignedUrls(
         },
         body: JSON.stringify({
           expiresIn:
-            SIGNED_URL_EXPIRES,
-          paths:
-            uniquePaths
-        })
+            CONFIG.signedUrlExpires,
+          paths: uniquePaths
+        }),
+        signal
       },
-      MEDIA_TIMEOUT_MS
+      timeoutMs
     )
 
   if (!response.ok) {
@@ -402,9 +494,7 @@ async function createSignedUrls(
   const result =
     new Map<string, string>()
 
-  for (
-    const item of data
-  ) {
+  for (const item of data) {
     if (
       !item.path ||
       !item.signedURL
@@ -420,8 +510,7 @@ async function createSignedUrls(
         "https://"
       )
         ? item.signedURL
-        : `${env.SUPABASE_URL}` +
-          `/storage/v1${item.signedURL}`
+        : `${env.SUPABASE_URL}/storage/v1${item.signedURL}`
 
     result.set(
       item.path,
@@ -454,9 +543,7 @@ function detectDictionaryQuery(
   dictionaryOnly: boolean
 } {
   const normalized =
-    query
-      .trim()
-      .toLowerCase()
+    query.trim().toLowerCase()
 
   const meaningOf =
     normalized.match(
@@ -503,8 +590,20 @@ function detectDictionaryQuery(
 }
 
 async function getDictionary(
-  word: string
+  word: string,
+  deadline: number,
+  signal: AbortSignal
 ): Promise<any> {
+  const timeoutMs =
+    effectiveTimeout(
+      deadline,
+      CONFIG.fetchTimeoutMs
+    )
+
+  if (timeoutMs <= 0) {
+    return null
+  }
+
   const url =
     `https://en.wiktionary.org/api/rest_v1/page/definition/` +
     encodeURIComponent(word)
@@ -516,9 +615,10 @@ async function getDictionary(
         headers: {
           Accept:
             "application/json"
-        }
+        },
+        signal
       },
-      3000
+      timeoutMs
     )
 
   if (!response.ok) {
@@ -530,12 +630,13 @@ async function getDictionary(
 
 async function loadCurrentRelease(
   env: Env,
-  signal?: AbortSignal
+  deadline: number,
+  signal: AbortSignal
 ): Promise<CurrentRelease> {
   return fetchGzipJson(
     env,
     "current.json",
-    SEARCH_TIMEOUT_MS,
+    deadline,
     signal
   )
 }
@@ -543,7 +644,8 @@ async function loadCurrentRelease(
 async function loadManifest(
   env: Env,
   current: CurrentRelease,
-  signal?: AbortSignal
+  deadline: number,
+  signal: AbortSignal
 ): Promise<Manifest> {
   const manifestPath =
     releasePath(
@@ -554,7 +656,7 @@ async function loadManifest(
   return fetchGzipJson(
     env,
     manifestPath,
-    SEARCH_TIMEOUT_MS,
+    deadline,
     signal
   )
 }
@@ -570,15 +672,12 @@ function normalizeTermShard(
 
   if (
     data &&
-    typeof data ===
-      "object" &&
+    typeof data === "object" &&
     !Array.isArray(data)
   ) {
     for (
-      const [
-        term,
-        entries
-      ] of Object.entries(data)
+      const [term, entries]
+      of Object.entries(data)
     ) {
       if (
         Array.isArray(entries)
@@ -590,18 +689,14 @@ function normalizeTermShard(
               entry =>
                 entry &&
                 typeof entry ===
-                  "object" &&
-                (entry as any).id !==
-                  undefined
+                  "object"
             )
-            .map(
-              entry => ({
-                ...(entry as any),
-                id: String(
-                  (entry as any).id
-                )
-              })
-            ) as TermEntry[]
+            .map(entry => ({
+              ...entry,
+              id: String(
+                (entry as any).id
+              )
+            })) as TermEntry[]
         )
       }
     }
@@ -617,8 +712,7 @@ function normalizeTermShard(
     ) {
       if (
         item &&
-        typeof item ===
-          "object" &&
+        typeof item === "object" &&
         typeof item.term ===
           "string" &&
         Array.isArray(
@@ -632,9 +726,7 @@ function normalizeTermShard(
               (entry: any) =>
                 entry &&
                 typeof entry ===
-                  "object" &&
-                entry.id !==
-                  undefined
+                  "object"
             )
             .map(
               (entry: any) => ({
@@ -657,6 +749,7 @@ async function getTermEntries(
   manifest: Manifest,
   current: CurrentRelease,
   terms: string[],
+  deadline: number,
   signal: AbortSignal
 ): Promise<
   Map<string, TermEntry[]>
@@ -670,85 +763,75 @@ async function getTermEntries(
       TermEntry[]
     >()
 
-  const shardLimit =
-    Math.min(
-      manifest.term_shards.length,
-      MAX_TERM_SHARDS_PER_SEARCH
-    )
+  if (
+    wanted.size === 0
+  ) {
+    return found
+  }
 
   for (
-    let index = 0;
-    index < shardLimit;
-    index += TERM_SHARD_CONCURRENCY
+    let offset = 0;
+    offset <
+      manifest.term_shards.length;
+    offset +=
+      CONFIG.termShardConcurrency
   ) {
     if (
-      signal.aborted ||
-      found.size ===
-        wanted.size
+      remainingTime(deadline) <=
+      500
     ) {
       break
     }
 
-    const batch =
+    const shardNames =
       manifest.term_shards.slice(
-        index,
-        index +
-          TERM_SHARD_CONCURRENCY
+        offset,
+        offset +
+          CONFIG.termShardConcurrency
       )
 
-    const shardResults =
-      await Promise.allSettled(
-        batch.map(
-          async shardName => {
-            if (
-              signal.aborted
-            ) {
-              return null
-            }
-
-            const shard =
-              releasePath(
-                current.version,
-                shardName
-              )
-
-            const timeout =
-              Math.max(
-                1000,
-                Math.min(
-                  5000,
-                  remainingTime(
-                    signal
-                  )
-                )
-              )
-
-            return fetchGzipJson(
-              env,
-              shard,
-              timeout,
-              signal
+    const tasks =
+      shardNames.map(
+        async shardName => {
+          const shard =
+            releasePath(
+              current.version,
+              shardName
             )
+
+          try {
+            const data =
+              await fetchGzipJson(
+                env,
+                shard,
+                deadline,
+                signal
+              )
+
+            return normalizeTermShard(
+              data
+            )
+          } catch {
+            return null
           }
-        )
+        }
+      )
+
+    const settled =
+      await Promise.allSettled(
+        tasks
       )
 
     for (
-      const result
-      of shardResults
+      const item of settled
     ) {
       if (
-        result.status !==
+        item.status !==
         "fulfilled" ||
-        !result.value
+        !item.value
       ) {
         continue
       }
-
-      const entries =
-        normalizeTermShard(
-          result.value
-        )
 
       for (
         const term of wanted
@@ -759,19 +842,23 @@ async function getTermEntries(
           continue
         }
 
-        const termEntries =
-          entries.get(term)
+        const entries =
+          item.value.get(term)
 
-        if (
-          termEntries &&
-          termEntries.length
-        ) {
+        if (entries) {
           found.set(
             term,
-            termEntries
+            entries
           )
         }
       }
+    }
+
+    if (
+      found.size ===
+      wanted.size
+    ) {
+      break
     }
   }
 
@@ -803,9 +890,7 @@ function normalizeDocuments(
     } else if (
       data.id !== undefined
     ) {
-      documents = [
-        data
-      ]
+      documents = [data]
     }
   }
 
@@ -820,9 +905,7 @@ function normalizeDocuments(
     )
     .map(item => ({
       ...item,
-      id: Number(
-        item.id
-      )
+      id: Number(item.id)
     }))
     .filter(
       item =>
@@ -837,11 +920,11 @@ async function getDocuments(
   manifest: Manifest,
   current: CurrentRelease,
   ids: number[],
+  deadline: number,
   signal: AbortSignal
 ): Promise<Document[]> {
   if (
-    ids.length === 0 ||
-    signal.aborted
+    ids.length === 0
   ) {
     return []
   }
@@ -850,26 +933,22 @@ async function getDocuments(
     new Set(
       ids.slice(
         0,
-        MAX_DOCUMENT_IDS
+        CONFIG.maxDocumentIds
       )
     )
 
-  const shardIds =
-    [
-      ...requestedIds
-    ].map(
-      id =>
-        Math.floor(
-          id / 250
-        )
-    )
-
-  const uniqueShardIds =
-    [
-      ...new Set(
-        shardIds
+  const shardIds = [
+    ...new Set(
+      [
+        ...requestedIds
+      ].map(
+        id =>
+          Math.floor(
+            id / 250
+          )
       )
-    ]
+    )
+  ]
 
   const documents =
     new Map<
@@ -877,90 +956,73 @@ async function getDocuments(
       Document
     >()
 
-  const limitedShardIds =
-    uniqueShardIds.slice(
-      0,
-      MAX_DOCUMENT_SHARDS_PER_SEARCH
-    )
-
   for (
-    let index = 0;
-    index <
-      limitedShardIds.length;
-    index +=
-      DOCUMENT_SHARD_CONCURRENCY
+    let offset = 0;
+    offset <
+      shardIds.length;
+    offset +=
+      CONFIG.documentShardConcurrency
   ) {
     if (
-      signal.aborted
+      remainingTime(deadline) <=
+      500
     ) {
       break
     }
 
     const batch =
-      limitedShardIds.slice(
-        index,
-        index +
-          DOCUMENT_SHARD_CONCURRENCY
+      shardIds.slice(
+        offset,
+        offset +
+          CONFIG.documentShardConcurrency
       )
 
-    const shardResults =
-      await Promise.allSettled(
-        batch.map(
-          async shardId => {
-            if (
-              signal.aborted
-            ) {
-              return []
-            }
+    const tasks =
+      batch.map(
+        async shardId => {
+          const shardName =
+            manifest.docs_shards[
+              shardId
+            ]
 
-            const shardName =
-              manifest
-                .docs_shards[
-                shardId
-              ]
+          if (!shardName) {
+            return []
+          }
 
-            if (!shardName) {
-              return []
-            }
+          const shard =
+            releasePath(
+              current.version,
+              shardName
+            )
 
-            const shard =
-              releasePath(
-                current.version,
-                shardName
-              )
-
-            const timeout =
-              Math.max(
-                1000,
-                Math.min(
-                  5000,
-                  remainingTime(
-                    signal
-                  )
-                )
-              )
-
+          try {
             const data =
               await fetchGzipJson(
                 env,
                 shard,
-                timeout,
+                deadline,
                 signal
               )
 
             return normalizeDocuments(
               data
             )
+          } catch {
+            return []
           }
-        )
+        }
+      )
+
+    const settled =
+      await Promise.allSettled(
+        tasks
       )
 
     for (
-      const result
-      of shardResults
+      const item of settled
     ) {
       if (
-        result.status !==
+        item.status !==
         "fulfilled"
       ) {
         continue
@@ -968,7 +1030,7 @@ async function getDocuments(
 
       for (
         const document
-        of result.value
+        of item.value
       ) {
         if (
           requestedIds.has(
@@ -1076,16 +1138,21 @@ function truth25(
         const entry
         of termEntries
       ) {
+        const entryId =
+          Number(entry.id)
+
         if (
-          Number(entry.id) ===
+          entryId ===
           document.id
         ) {
           score +=
             entry.tf * 2
 
           score +=
-            (entry.title || 0) *
-            8
+            (
+              entry.title ||
+              0
+            ) * 8
 
           break
         }
@@ -1209,55 +1276,12 @@ function normalizeUrl(
   }
 }
 
-function mediaDocumentIds(
+function getMediaPageUrl(
   item: any
-): string[] {
-  const fields = [
-    "document_id",
-    "documentId",
-    "doc_id",
-    "docId",
-    "result_id",
-    "resultId",
-    "page_id",
-    "pageId",
-    "parent_id",
-    "parentId",
-    "source_id",
-    "sourceId"
-  ]
-
-  const ids: string[] =
-    []
-
-  for (
-    const field of fields
-  ) {
-    const value =
-      item?.[field]
-
-    if (
-      value !== undefined &&
-      value !== null &&
-      String(value).trim()
-    ) {
-      ids.push(
-        String(value)
-      )
-    }
-  }
-
-  return ids
-}
-
-function mediaDocumentUrls(
-  item: any
-): string[] {
+): string {
   const fields = [
     "page_url",
-    "pageUrl",
     "source_url",
-    "sourceUrl",
     "source",
     "document_url",
     "documentUrl",
@@ -1265,105 +1289,65 @@ function mediaDocumentUrls(
     "parentUrl",
     "origin_url",
     "originUrl",
-    "source_page",
-    "sourcePage",
     "page",
-    "parent",
-    "url"
+    "source_page",
+    "sourcePage"
   ]
-
-  const urls: string[] =
-    []
 
   for (
     const field of fields
   ) {
-    const value =
-      item?.[field]
-
     if (
-      typeof value ===
+      typeof item?.[field] ===
         "string" &&
-      value.trim()
+      item[field].trim()
     ) {
-      urls.push(
-        normalizeUrl(value)
-      )
+      return item[field]
     }
   }
 
-  return [
-    ...new Set(
-      urls.filter(Boolean)
-    )
-  ]
+  return ""
 }
 
 function mediaMatchesDocument(
   item: any,
-  document: Document
+  documentUrl: string
 ): boolean {
-  const documentId =
-    String(document.id)
-
-  const ids =
-    mediaDocumentIds(item)
-
-  if (
-    ids.includes(
-      documentId
-    )
-  ) {
-    return true
-  }
-
-  const documentUrl =
+  const target =
     normalizeUrl(
-      document.url
+      documentUrl
     )
 
-  if (!documentUrl) {
+  if (!target) {
     return false
   }
 
-  const urls =
-    mediaDocumentUrls(item)
+  const pageUrl =
+    getMediaPageUrl(item)
 
   if (
-    urls.includes(
-      documentUrl
-    )
+    pageUrl &&
+    normalizeUrl(
+      pageUrl
+    ) === target
   ) {
     return true
   }
 
-  try {
-    const target =
-      new URL(
-        documentUrl
-      )
+  const mediaUrl =
+    typeof item?.url ===
+      "string"
+      ? item.url
+      : ""
 
-    for (
-      const mediaUrl
-      of urls
-    ) {
-      try {
-        const source =
-          new URL(
-            mediaUrl
-          )
-
-        if (
-          source.hostname ===
-            target.hostname &&
-          source.pathname ===
-            target.pathname
-        ) {
-          return true
-        }
-      } catch {}
-    }
-  } catch {}
+  if (
+    mediaUrl &&
+    normalizeUrl(
+      mediaUrl
+    ) === target
+  ) {
+    return true
+  }
 
   return false
 }
@@ -1376,7 +1360,7 @@ function compactMedia(
 
   if (
     typeof item.url ===
-      "string"
+    "string"
   ) {
     media.url =
       item.url
@@ -1384,7 +1368,7 @@ function compactMedia(
 
   if (
     typeof item.path ===
-      "string"
+    "string"
   ) {
     media.path =
       item.path
@@ -1392,7 +1376,7 @@ function compactMedia(
 
   if (
     typeof item.title ===
-      "string"
+    "string"
   ) {
     media.title =
       item.title
@@ -1400,7 +1384,7 @@ function compactMedia(
 
   if (
     typeof item.alt ===
-      "string"
+    "string"
   ) {
     media.alt =
       item.alt
@@ -1408,7 +1392,7 @@ function compactMedia(
 
   if (
     typeof item.type ===
-      "string"
+    "string"
   ) {
     media.type =
       item.type
@@ -1416,7 +1400,7 @@ function compactMedia(
 
   if (
     typeof item.mime_type ===
-      "string"
+    "string"
   ) {
     media.mime_type =
       item.mime_type
@@ -1424,7 +1408,7 @@ function compactMedia(
 
   if (
     typeof item.thumbnail ===
-      "string"
+    "string"
   ) {
     media.thumbnail =
       item.thumbnail
@@ -1432,7 +1416,7 @@ function compactMedia(
 
   if (
     typeof item.thumbnail_path ===
-      "string"
+    "string"
   ) {
     media.thumbnail_path =
       item.thumbnail_path
@@ -1441,144 +1425,124 @@ function compactMedia(
   return media
 }
 
-async function createSignedUrlsSafe(
-  env: Env,
-  bucket: string,
-  paths: string[]
-): Promise<Map<string, string>> {
-  if (
-    paths.length === 0
-  ) {
-    return new Map()
-  }
-
-  try {
-    return await createSignedUrls(
-      env,
-      bucket,
-      paths
-    )
-  } catch {
-    return new Map()
-  }
-}
-
 async function attachMedia(
   env: Env,
   manifest: Manifest,
   current: CurrentRelease,
   results: SearchResult[],
+  deadline: number,
   signal: AbortSignal
-): Promise<void> {
+): Promise<SearchResult[]> {
   if (
-    results.length === 0 ||
-    signal.aborted
+    results.length === 0
   ) {
-    return
+    return results
   }
 
-  const mediaResults =
-    await Promise.allSettled([
-      manifest.images
-        ? fetchGzipJson(
-            env,
-            releasePath(
-              current.version,
-              manifest.images
-            ),
-            Math.min(
-              MEDIA_TIMEOUT_MS,
-              Math.max(
-                1000,
-                remainingTime(
-                  signal
-                )
-              )
-            ),
-            signal
-          )
-        : Promise.resolve([]),
+  let images: any[] =
+    []
 
-      manifest.videos
-        ? fetchGzipJson(
-            env,
-            releasePath(
-              current.version,
-              manifest.videos
-            ),
-            Math.min(
-              MEDIA_TIMEOUT_MS,
-              Math.max(
-                1000,
-                remainingTime(
-                  signal
-                )
+  let videos: any[] =
+    []
+
+  const imagePromise =
+    manifest.images
+      ? fetchGzipJson(
+          env,
+          releasePath(
+            current.version,
+            manifest.images
+          ),
+          deadline,
+          signal,
+          CONFIG.mediaTimeoutMs
+        )
+          .then(
+            data =>
+              normalizeMedia(
+                data
               )
-            ),
-            signal
           )
-        : Promise.resolve([])
+          .catch(
+            () => []
+          )
+      : Promise.resolve(
+          []
+        )
+
+  const videoPromise =
+    manifest.videos
+      ? fetchGzipJson(
+          env,
+          releasePath(
+            current.version,
+            manifest.videos
+          ),
+          deadline,
+          signal,
+          CONFIG.mediaTimeoutMs
+        )
+          .then(
+            data =>
+              normalizeMedia(
+                data
+              )
+          )
+          .catch(
+            () => []
+          )
+      : Promise.resolve(
+          []
+        )
+
+  const [
+    loadedImages,
+    loadedVideos
+  ] =
+    await Promise.all([
+      imagePromise,
+      videoPromise
     ])
 
-  const images =
-    mediaResults[0]?.status ===
-    "fulfilled"
-      ? normalizeMedia(
-          mediaResults[0].value
-        )
-      : []
+  images =
+    loadedImages
 
-  const videos =
-    mediaResults[1]?.status ===
-    "fulfilled"
-      ? normalizeMedia(
-          mediaResults[1].value
-        )
-      : []
+  videos =
+    loadedVideos
 
-  const imagePaths: string[] =
-    []
-
-  const videoThumbnailPaths:
-    string[] =
-    []
-
-  const imageMatches =
+  const resultImages =
     new Map<
-      number,
+      SearchResult,
       any[]
     >()
 
-  const videoMatches =
+  const resultVideos =
     new Map<
-      number,
+      SearchResult,
       any[]
     >()
+
+  const imagePaths:
+    string[] = []
+
+  const thumbnailPaths:
+    string[] = []
 
   for (
     const result of results
   ) {
-    const document: Document = {
-      id: result.id,
-      url: result.url,
-      title: result.title,
-      description:
-        result.description,
-      text: ""
-    }
-
     const matchedImages =
       images
         .filter(
           image =>
             mediaMatchesDocument(
               image,
-              document
+              result.url
             )
         )
         .slice(
           0,
-          MAX_IMAGES_PER_RESULT
+          CONFIG.maxImagesPerResult
         )
 
     const matchedVideos =
@@ -1587,21 +1551,21 @@ async function attachMedia(
           video =>
             mediaMatchesDocument(
               video,
-              document
+              result.url
             )
         )
         .slice(
           0,
-          MAX_VIDEOS_PER_RESULT
+          CONFIG.maxVideosPerResult
         )
 
-    imageMatches.set(
-      result.id,
+    resultImages.set(
+      result,
       matchedImages
     )
 
-    videoMatches.set(
-      result.id,
+    resultVideos.set(
+      result,
       matchedVideos
     )
 
@@ -1611,7 +1575,7 @@ async function attachMedia(
     ) {
       if (
         typeof image.path ===
-          "string"
+        "string"
       ) {
         imagePaths.push(
           image.path
@@ -1625,54 +1589,119 @@ async function attachMedia(
     ) {
       if (
         typeof video.thumbnail_path ===
-          "string"
+        "string"
       ) {
-        videoThumbnailPaths.push(
+        thumbnailPaths.push(
           video.thumbnail_path
         )
       }
     }
   }
 
-  const imageSignedUrls =
-    await createSignedUrlsSafe(
-      env,
-      "images",
-      [
-        ...new Set(
-          imagePaths
-        )
-      ].slice(
-        0,
-        MAX_IMAGE_SIGNED_URLS
+  const limitedImagePaths =
+    [
+      ...new Set(
+        imagePaths
       )
+    ].slice(
+      0,
+      CONFIG.maxImageSignedUrls
     )
 
-  const videoThumbnailSignedUrls =
-    await createSignedUrlsSafe(
-      env,
-      "videos",
-      [
-        ...new Set(
-          videoThumbnailPaths
-        )
-      ].slice(
-        0,
-        MAX_IMAGE_SIGNED_URLS
+  const limitedThumbnailPaths =
+    [
+      ...new Set(
+        thumbnailPaths
       )
+    ].slice(
+      0,
+      CONFIG.maxImageSignedUrls
     )
+
+  let imageSignedUrls =
+    new Map<
+      string,
+      string
+    >()
+
+  let thumbnailSignedUrls =
+    new Map<
+      string,
+      string
+    >()
+
+  const imageSigningPromise =
+    limitedImagePaths.length >
+      0
+      ? createSignedUrls(
+          env,
+          "images",
+          limitedImagePaths,
+          deadline,
+          signal
+        ).catch(
+          () =>
+            new Map<
+              string,
+              string
+            >()
+        )
+      : Promise.resolve(
+          new Map<
+            string,
+            string
+          >()
+      )
+
+  const thumbnailSigningPromise =
+    limitedThumbnailPaths.length >
+      0
+      ? createSignedUrls(
+          env,
+          "videos",
+          limitedThumbnailPaths,
+          deadline,
+          signal
+        ).catch(
+          () =>
+            new Map<
+              string,
+              string
+            >()
+        )
+      : Promise.resolve(
+          new Map<
+            string,
+            string
+          >()
+      )
+
+  const [
+    signedImages,
+    signedThumbnails
+  ] =
+    await Promise.all([
+      imageSigningPromise,
+      thumbnailSigningPromise
+    ])
+
+  imageSignedUrls =
+    signedImages
+
+  thumbnailSignedUrls =
+    signedThumbnails
 
   for (
     const result of results
   ) {
     const matchedImages =
-      imageMatches.get(
-        result.id
+      resultImages.get(
+        result
       ) || []
 
     const matchedVideos =
-      videoMatches.get(
-        result.id
+      resultVideos.get(
+        result
       ) || []
 
     result.images =
@@ -1684,7 +1713,8 @@ async function attachMedia(
             )
 
           if (
-            image.path &&
+            typeof image.path ===
+              "string" &&
             imageSignedUrls.has(
               image.path
             )
@@ -1708,13 +1738,14 @@ async function attachMedia(
             )
 
           if (
-            video.thumbnail_path &&
-            videoThumbnailSignedUrls.has(
+            typeof video.thumbnail_path ===
+              "string" &&
+            thumbnailSignedUrls.has(
               video.thumbnail_path
             )
           ) {
             media.thumbnail =
-              videoThumbnailSignedUrls.get(
+              thumbnailSignedUrls.get(
                 video.thumbnail_path
               )
           }
@@ -1723,6 +1754,8 @@ async function attachMedia(
         }
       )
   }
+
+  return results
 }
 
 function compactResult(
@@ -1735,33 +1768,23 @@ function compactResult(
     title:
       document.title || "",
     description:
-      document.description ||
-      "",
+      document.description || "",
     score,
     images: [],
     videos: []
   }
 }
 
-function remainingTime(
-  signal: AbortSignal
-): number {
-  if (
-    signal.aborted
-  ) {
-    return 1
-  }
-
-  return 12000
-}
-
 async function handleSearch(
   request: Request,
   env: Env,
+  deadline: number,
   signal: AbortSignal
 ): Promise<Response> {
   const url =
-    new URL(request.url)
+    new URL(
+      request.url
+    )
 
   const query =
     url.searchParams
@@ -1769,12 +1792,16 @@ async function handleSearch(
       ?.trim() || ""
 
   if (!query) {
-    return jsonResponse(
+    return Response.json(
       {
         error:
           "Missing query parameter"
       },
-      400
+      {
+        status: 400,
+        headers:
+          CORS_HEADERS
+      }
     )
   }
 
@@ -1789,13 +1816,21 @@ async function handleSearch(
   ) {
     const dictionary =
       await getDictionary(
-        dictionaryQuery.word
+        dictionaryQuery.word,
+        deadline,
+        signal
       )
 
-    return jsonResponse({
-      query,
-      dictionary
-    })
+    return Response.json(
+      {
+        query,
+        dictionary
+      },
+      {
+        headers:
+          CORS_HEADERS
+      }
+    )
   }
 
   const terms =
@@ -1804,16 +1839,23 @@ async function handleSearch(
   if (
     terms.length === 0
   ) {
-    return jsonResponse({
-      query,
-      dictionary: null,
-      results: []
-    })
+    return Response.json(
+      {
+        query,
+        dictionary: null,
+        results: []
+      },
+      {
+        headers:
+          CORS_HEADERS
+      }
+    )
   }
 
   const current =
     await loadCurrentRelease(
       env,
+      deadline,
       signal
     )
 
@@ -1821,6 +1863,7 @@ async function handleSearch(
     await loadManifest(
       env,
       current,
+      deadline,
       signal
     )
 
@@ -1830,18 +1873,9 @@ async function handleSearch(
       manifest,
       current,
       terms,
+      deadline,
       signal
     )
-
-  if (
-    termEntries.size === 0
-  ) {
-    return jsonResponse({
-      query,
-      dictionary: null,
-      results: []
-    })
-  }
 
   const documentIds =
     new Set<number>()
@@ -1861,11 +1895,13 @@ async function handleSearch(
         Number.isInteger(id) &&
         id >= 0
       ) {
-        documentIds.add(id)
+        documentIds.add(
+          id
+        )
 
         if (
           documentIds.size >=
-          MAX_DOCUMENT_IDS
+          CONFIG.maxDocumentIds
         ) {
           break
         }
@@ -1874,20 +1910,10 @@ async function handleSearch(
 
     if (
       documentIds.size >=
-      MAX_DOCUMENT_IDS
+      CONFIG.maxDocumentIds
     ) {
       break
     }
-  }
-
-  if (
-    documentIds.size === 0
-  ) {
-    return jsonResponse({
-      query,
-      dictionary: null,
-      results: []
-    })
   }
 
   const documents =
@@ -1895,9 +1921,8 @@ async function handleSearch(
       env,
       manifest,
       current,
-      [
-        ...documentIds
-      ],
+      [...documentIds],
+      deadline,
       signal
     )
 
@@ -1915,10 +1940,6 @@ async function handleSearch(
             )
         })
       )
-      .filter(
-        item =>
-          item.score > 0
-      )
       .sort(
         (a, b) =>
           b.score -
@@ -1926,7 +1947,7 @@ async function handleSearch(
       )
       .slice(
         0,
-        MAX_SEARCH_RESULTS
+        CONFIG.maxSearchResults
       )
 
   const results =
@@ -1938,30 +1959,30 @@ async function handleSearch(
         )
     )
 
-  if (
-    results.length > 0 &&
-    !signal.aborted
-  ) {
-    await attachMedia(
-      env,
-      manifest,
-      current,
-      results,
-      signal
-    )
-  }
+  await attachMedia(
+    env,
+    manifest,
+    current,
+    results,
+    deadline,
+    signal
+  )
 
   let dictionary =
     null
 
   if (
     dictionaryQuery.word &&
-    !signal.aborted
+    !dictionaryQuery.dictionaryOnly &&
+    remainingTime(deadline) >
+      500
   ) {
     try {
       dictionary =
         await getDictionary(
-          dictionaryQuery.word
+          dictionaryQuery.word,
+          deadline,
+          signal
         )
     } catch {
       dictionary =
@@ -1969,256 +1990,430 @@ async function handleSearch(
     }
   }
 
-  return jsonResponse({
-    query,
-    dictionary,
-    results
-  })
+  return Response.json(
+    {
+      query,
+      dictionary,
+      results
+    },
+    {
+      headers:
+        CORS_HEADERS
+    }
+  )
+}
+
+function jsonResponse(
+  body: unknown,
+  status = 200
+): Response {
+  return new Response(
+    JSON.stringify(body),
+    {
+      status,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type":
+          "application/json; charset=utf-8"
+      }
+    }
+  )
+}
+
+function readRequestBody(
+  request: http.IncomingMessage
+): Promise<string> {
+  return new Promise(
+    (resolve, reject) => {
+      let data = ""
+
+      request.setEncoding(
+        "utf8"
+      )
+
+      request.on(
+        "data",
+        chunk => {
+          data += chunk
+
+          if (
+            data.length >
+            1024 * 1024
+          ) {
+            reject(
+              new Error(
+                "Request body too large"
+              )
+            )
+
+            request.destroy()
+          }
+        }
+      )
+
+      request.on(
+        "end",
+        () => resolve(data)
+      )
+
+      request.on(
+        "error",
+        reject
+      )
+    }
+  )
+}
+
+async function handleHttpRequest(
+  request: http.IncomingMessage
+): Promise<Response> {
+  const host =
+    request.headers.host ||
+    "localhost"
+
+  const protocol =
+    "http"
+
+  const url =
+    new URL(
+      request.url ||
+        "/",
+      `${protocol}://${host}`
+    )
+
+  const headers =
+    new Headers()
+
+  for (
+    const [
+      key,
+      value
+    ]
+    of Object.entries(
+      request.headers
+    )
+  ) {
+    if (
+      Array.isArray(value)
+    ) {
+      headers.set(
+        key,
+        value.join(", ")
+      )
+    } else if (
+      value !== undefined
+    ) {
+      headers.set(
+        key,
+        value
+      )
+    }
+  }
+
+  const body =
+    request.method ===
+      "GET" ||
+    request.method ===
+      "HEAD"
+      ? undefined
+      : await readRequestBody(
+          request
+        )
+
+  return new Request(
+    url,
+    {
+      method:
+        request.method ||
+        "GET",
+      headers,
+      body
+    }
+  )
+}
+
+function sendNodeResponse(
+  response: Response,
+  nodeResponse: http.ServerResponse
+): void {
+  const headers:
+    Record<string, string> =
+    {}
+
+  response.headers.forEach(
+    (value, key) => {
+      headers[key] =
+        value
+    }
+  )
+
+  nodeResponse.writeHead(
+    response.status,
+    headers
+  )
+
+  if (
+    response.body
+  ) {
+    response
+      .arrayBuffer()
+      .then(
+        buffer => {
+          nodeResponse.end(
+            Buffer.from(
+              buffer
+            )
+          )
+        }
+      )
+      .catch(
+        error => {
+          nodeResponse.destroy(
+            error
+          )
+        }
+      )
+
+    return
+  }
+
+  nodeResponse.end()
 }
 
 const env =
   loadEnv()
 
-const port =
-  Number(
-    process.env.PORT || 10000
-  )
-
-const host =
-  "0.0.0.0"
-
 const server =
   http.createServer(
     async (
-      req,
-      res
+      nodeRequest,
+      nodeResponse
     ) => {
       const started =
         Date.now()
 
       try {
-        if (
-          req.method ===
-          "OPTIONS"
-        ) {
-          res.writeHead(
-            204,
-            CORS_HEADERS
+        const request =
+          await handleHttpRequest(
+            nodeRequest
           )
 
-          res.end()
+        if (
+          request.method ===
+          "OPTIONS"
+        ) {
+          sendNodeResponse(
+            new Response(
+              null,
+              {
+                status: 204,
+                headers:
+                  CORS_HEADERS
+              }
+            ),
+            nodeResponse
+          )
+
           return
         }
 
         if (
-          req.method !==
+          request.method !==
           "GET"
         ) {
-          const response =
+          sendNodeResponse(
             jsonResponse(
               {
                 error:
                   "Method not allowed"
               },
               405
-            )
-
-          const body =
-            await response.text()
-
-          res.writeHead(
-            405,
-            Object.fromEntries(
-              response.headers
-            )
+            ),
+            nodeResponse
           )
 
-          res.end(body)
           return
         }
 
         const requestUrl =
           new URL(
-            req.url || "/",
-            `http://${
-              req.headers.host ||
-              "localhost"
-            }`
+            request.url
           )
 
         if (
           requestUrl.pathname ===
           "/health"
         ) {
-          const response =
+          sendNodeResponse(
             jsonResponse({
               ok: true,
               service:
                 "seerchsqapi",
               runtime:
-                "render",
-              uptime:
-                process.uptime()
-            })
-
-          const body =
-            await response.text()
-
-          res.writeHead(
-            200,
-            Object.fromEntries(
-              response.headers
-            )
+                "render"
+            }),
+            nodeResponse
           )
 
-          res.end(body)
           return
         }
 
         if (
-          requestUrl.pathname ===
+          requestUrl.pathname !==
           "/search"
         ) {
-          const request =
-            new Request(
-              `http://localhost${requestUrl.pathname}${requestUrl.search}`,
+          sendNodeResponse(
+            jsonResponse(
               {
-                method:
-                  "GET"
-              }
-            )
-
-          const controller =
-            new AbortController()
-
-          const timeout =
-            setTimeout(
-              () => {
-                controller.abort()
+                error:
+                  "Not found"
               },
-              SEARCH_TIMEOUT_MS
-            )
-
-          try {
-            const response =
-              await handleSearch(
-                request,
-                env,
-                controller.signal
-              )
-
-            const body =
-              await response.text()
-
-            res.writeHead(
-              response.status,
-              Object.fromEntries(
-                response.headers
-              )
-            )
-
-            res.end(body)
-
-            console.log(
-              `[search] q=${JSON.stringify(
-                requestUrl.searchParams.get(
-                  "q"
-                ) || ""
-              )} status=${response.status} ${Date.now() - started}ms`
-            )
-          } finally {
-            clearTimeout(
-              timeout
-            )
-          }
+              404
+            ),
+            nodeResponse
+          )
 
           return
         }
 
-        const response =
-          jsonResponse(
-            {
-              error:
-                "Not found"
+        const deadline =
+          Date.now() +
+          CONFIG.requestTimeoutMs
+
+        const controller =
+          new AbortController()
+
+        const timer =
+          setTimeout(
+            () => {
+              controller.abort()
             },
-            404
+            CONFIG.requestTimeoutMs
           )
 
-        const body =
-          await response.text()
+        try {
+          const response =
+            await handleSearch(
+              request,
+              env,
+              deadline,
+              controller.signal
+            )
 
-        res.writeHead(
-          404,
-          Object.fromEntries(
-            response.headers
+          sendNodeResponse(
+            response,
+            nodeResponse
           )
-        )
 
-        res.end(body)
+          const elapsed =
+            Date.now() -
+            started
+
+          console.log(
+            JSON.stringify({
+              type:
+                "search",
+              query:
+                requestUrl.searchParams.get(
+                  "q"
+                ) || "",
+              status:
+                response.status,
+              duration_ms:
+                elapsed
+            })
+          )
+        } finally {
+          clearTimeout(timer)
+        }
       } catch (error) {
+        const elapsed =
+          Date.now() -
+          started
+
         console.error(
-          "[server] request failed:",
-          error
+          JSON.stringify({
+            type:
+              "request_error",
+            duration_ms:
+              elapsed,
+            error:
+              error instanceof Error
+                ? error.stack ||
+                  error.message
+                : String(error)
+          })
         )
 
-        const message =
-          error instanceof Error
-            ? error.message
-            : String(error)
-
-        const response =
-          jsonResponse(
-            {
-              error:
-                message
-            },
-            500
+        if (
+          !nodeResponse.headersSent
+        ) {
+          sendNodeResponse(
+            jsonResponse(
+              {
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : String(error)
+              },
+              500
+            ),
+            nodeResponse
           )
-
-        const body =
-          await response.text()
-
-        res.writeHead(
-          500,
-          Object.fromEntries(
-            response.headers
-          )
-        )
-
-        res.end(body)
+        } else {
+          nodeResponse.destroy()
+        }
       }
     }
   )
 
+const port =
+  Number(
+    process.env.PORT ||
+      10000
+  )
+
 server.listen(
   port,
-  host,
+  "0.0.0.0",
   () => {
     console.log(
-      `Seendex Remade API listening on ${host}:${port}`
+      JSON.stringify({
+        service:
+          "seerchsqapi",
+        runtime:
+          "render",
+        port,
+        request_timeout_ms:
+          CONFIG.requestTimeoutMs,
+        term_concurrency:
+          CONFIG.termShardConcurrency,
+        document_concurrency:
+          CONFIG.documentShardConcurrency
+      })
     )
   }
 )
 
 function shutdown(
   signal: string
-) {
+): void {
   console.log(
-    `[server] received ${signal}, shutting down`
+    `Received ${signal}, shutting down`
   )
 
   server.close(
-    () => {
+    error => {
+      if (error) {
+        console.error(
+          error
+        )
+        process.exit(1)
+      }
+
       process.exit(0)
     }
   )
-
-  setTimeout(
-    () => {
-      process.exit(1)
-    },
-    10000
-  ).unref()
 }
 
 process.on(
