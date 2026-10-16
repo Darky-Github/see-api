@@ -1,3 +1,4 @@
+
 import http from "node:http"
 import { gunzip } from "node:zlib"
 import { promisify } from "node:util"
@@ -73,17 +74,22 @@ interface SearchResult {
 
 const MAX_DOCUMENT_IDS = 1000
 const MAX_SEARCH_RESULTS = 25
-const DEFAULT_SEARCH_LIMIT = 20
+
 const MAX_IMAGES_PER_RESULT = 4
 const MAX_VIDEOS_PER_RESULT = 2
+
 const MAX_IMAGE_SIGNED_URLS = 100
 const MAX_VIDEO_SIGNED_URLS = 100
+
 const SIGNED_URL_EXPIRES = 3600
+
 const MAX_TERM_SHARDS_PER_SEARCH = 128
 const MAX_DOCUMENT_SHARDS_PER_SEARCH = 128
+
 const TERM_SHARD_CONCURRENCY = 12
 const DOCUMENT_SHARD_CONCURRENCY = 12
 const SIGNED_URL_CONCURRENCY = 12
+
 const SEARCH_TIMEOUT_MS = 15000
 const MEDIA_TIMEOUT_MS = 5000
 
@@ -99,15 +105,22 @@ const CORS_HEADERS = {
    ========================================================= */
 
 function loadEnv(): Env {
-  const SUPABASE_URL = process.env.SUPABASE_URL?.trim()
-  const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY?.trim()
+  const SUPABASE_URL =
+    process.env.SUPABASE_URL?.trim()
+
+  const SUPABASE_SECRET_KEY =
+    process.env.SUPABASE_SECRET_KEY?.trim()
 
   if (!SUPABASE_URL) {
-    throw new Error("Missing SUPABASE_URL environment variable")
+    throw new Error(
+      "Missing SUPABASE_URL environment variable"
+    )
   }
 
   if (!SUPABASE_SECRET_KEY) {
-    throw new Error("Missing SUPABASE_SECRET_KEY environment variable")
+    throw new Error(
+      "Missing SUPABASE_SECRET_KEY environment variable"
+    )
   }
 
   return {
@@ -127,7 +140,15 @@ function timeoutSignal(
   signal?: AbortSignal | null
 ): AbortSignal {
   const timeout = AbortSignal.timeout(timeoutMs)
-  return signal ? AbortSignal.any([signal, timeout]) : timeout
+
+  if (!signal) {
+    return timeout
+  }
+
+  return AbortSignal.any([
+    signal,
+    timeout
+  ])
 }
 
 async function fetchWithTimeout(
@@ -137,7 +158,10 @@ async function fetchWithTimeout(
 ): Promise<Response> {
   return fetch(input, {
     ...init,
-    signal: timeoutSignal(timeoutMs, init.signal)
+    signal: timeoutSignal(
+      timeoutMs,
+      init.signal
+    )
   })
 }
 
@@ -145,28 +169,46 @@ async function fetchWithTimeout(
    CORS / RESPONSES
    ========================================================= */
 
-function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type": "application/json; charset=utf-8"
+function jsonResponse(
+  data: unknown,
+  status = 200
+): Response {
+  return new Response(
+    JSON.stringify(data),
+    {
+      status,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type":
+          "application/json; charset=utf-8"
+      }
     }
-  })
+  )
 }
 
 /* =========================================================
    SUPABASE STORAGE
    ========================================================= */
 
-function storageUrl(env: Env, path: string): string {
-  return `${env.SUPABASE_URL}/storage/v1/object/authenticated/seendex/${path.replace(/^\/+/, "")}`
+function storageUrl(
+  env: Env,
+  path: string
+): string {
+  return (
+    `${env.SUPABASE_URL}` +
+    `/storage/v1/object/authenticated/seendex/` +
+    path.replace(/^\/+/, "")
+  )
 }
 
-function supabaseHeaders(env: Env): HeadersInit {
+function supabaseHeaders(
+  env: Env
+): HeadersInit {
   return {
-    Authorization: `Bearer ${env.SUPABASE_SECRET_KEY}`,
-    apikey: env.SUPABASE_SECRET_KEY
+    Authorization:
+      `Bearer ${env.SUPABASE_SECRET_KEY}`,
+    apikey:
+      env.SUPABASE_SECRET_KEY
   }
 }
 
@@ -182,19 +224,29 @@ async function fetchGzipText(
 ): Promise<string> {
   const response = await fetchWithTimeout(
     storageUrl(env, path),
-    { headers: supabaseHeaders(env), signal },
+    {
+      headers: supabaseHeaders(env),
+      signal
+    },
     timeoutMs
   )
 
   if (!response.ok) {
     const body = await response.text()
+
     throw new Error(
-      `Supabase gzip request failed: ${response.status} ${response.statusText} | ${path} | ${body.slice(0, 500)}`
+      `Supabase gzip request failed: ` +
+      `${response.status} ${response.statusText} | ` +
+      `${path} | ${body.slice(0, 500)}`
     )
   }
 
-  const bytes = Buffer.from(await response.arrayBuffer())
+  const bytes = Buffer.from(
+    await response.arrayBuffer()
+  )
+
   const decompressed = await gunzipAsync(bytes)
+
   return decompressed.toString("utf8")
 }
 
@@ -206,23 +258,34 @@ async function fetchJson(
 ): Promise<any> {
   const response = await fetchWithTimeout(
     storageUrl(env, path),
-    { headers: supabaseHeaders(env), signal },
+    {
+      headers: supabaseHeaders(env),
+      signal
+    },
     timeoutMs
   )
 
   if (!response.ok) {
     const body = await response.text()
+
     throw new Error(
-      `Supabase request failed: ${response.status} ${response.statusText} | ${path} | ${body.slice(0, 500)}`
+      `Supabase request failed: ` +
+      `${response.status} ${response.statusText} | ` +
+      `${path} | ${body.slice(0, 500)}`
     )
   }
 
   return response.json()
 }
 
-function parseJsonOrJsonl(text: string): any {
+function parseJsonOrJsonl(
+  text: string
+): any {
   const trimmed = text.trim()
-  if (!trimmed) return null
+
+  if (!trimmed) {
+    return null
+  }
 
   try {
     return JSON.parse(trimmed)
@@ -242,12 +305,24 @@ async function fetchGzipJson(
   timeoutMs = SEARCH_TIMEOUT_MS,
   signal?: AbortSignal
 ): Promise<any> {
-  const text = await fetchGzipText(env, path, timeoutMs, signal)
+  const text = await fetchGzipText(
+    env,
+    path,
+    timeoutMs,
+    signal
+  )
+
   return parseJsonOrJsonl(text)
 }
 
-function releasePath(version: string, path: string): string {
-  if (path.startsWith("releases/")) return path
+function releasePath(
+  version: string,
+  path: string
+): string {
+  if (path.startsWith("releases/")) {
+    return path
+  }
+
   return `${version}/${path}`
 }
 
@@ -258,9 +333,14 @@ function releasePath(version: string, path: string): string {
 async function mapConcurrent<T, R>(
   items: T[],
   concurrency: number,
-  worker: (item: T, index: number) => Promise<R>
+  worker: (
+    item: T,
+    index: number
+  ) => Promise<R>
 ): Promise<R[]> {
-  if (items.length === 0) return []
+  if (items.length === 0) {
+    return []
+  }
 
   const results = new Array<R>(items.length)
   let cursor = 0
@@ -268,13 +348,30 @@ async function mapConcurrent<T, R>(
   async function runner(): Promise<void> {
     while (true) {
       const index = cursor++
-      if (index >= items.length) return
-      results[index] = await worker(items[index], index)
+
+      if (index >= items.length) {
+        return
+      }
+
+      results[index] = await worker(
+        items[index],
+        index
+      )
     }
   }
 
-  const workers = Math.min(Math.max(1, concurrency), items.length)
-  await Promise.all(Array.from({ length: workers }, () => runner()))
+  const workers = Math.min(
+    Math.max(1, concurrency),
+    items.length
+  )
+
+  await Promise.all(
+    Array.from(
+      { length: workers },
+      () => runner()
+    )
+  )
+
   return results
 }
 
@@ -288,15 +385,29 @@ async function createSignedUrls(
   paths: string[],
   signal?: AbortSignal
 ): Promise<Map<string, string>> {
-  const uniquePaths = [...new Set(paths.filter(Boolean))]
-  if (uniquePaths.length === 0) return new Map()
+  const uniquePaths = [
+    ...new Set(paths.filter(Boolean))
+  ]
 
-  const batches: string[][] = []
-  for (let index = 0; index < uniquePaths.length; index += 100) {
-    batches.push(uniquePaths.slice(index, index + 100))
+  if (uniquePaths.length === 0) {
+    return new Map()
   }
 
-  const url = `${env.SUPABASE_URL}/storage/v1/object/sign/${bucket}`
+  const batches: string[][] = []
+
+  for (
+    let index = 0;
+    index < uniquePaths.length;
+    index += 100
+  ) {
+    batches.push(
+      uniquePaths.slice(index, index + 100)
+    )
+  }
+
+  const url =
+    `${env.SUPABASE_URL}` +
+    `/storage/v1/object/sign/${bucket}`
 
   const results = await mapConcurrent(
     batches,
@@ -320,14 +431,29 @@ async function createSignedUrls(
           MEDIA_TIMEOUT_MS
         )
 
-        if (!response.ok) return []
+        if (!response.ok) {
+          console.error(
+            `[media] Signed URL request failed: ` +
+            `${response.status} for bucket ${bucket}`
+          )
+          return []
+        }
 
         return await response.json() as Array<{
           path?: string
           signedURL?: string
           error?: string
         }>
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) {
+          throw error
+        }
+
+        console.error(
+          `[media] Signed URL request error for ${bucket}:`,
+          error
+        )
+
         return []
       }
     }
@@ -337,7 +463,9 @@ async function createSignedUrls(
 
   for (const batch of results) {
     for (const item of batch) {
-      if (!item.path || !item.signedURL) continue
+      if (!item.path || !item.signedURL) {
+        continue
+      }
 
       const signedURL =
         item.signedURL.startsWith("http://") ||
@@ -356,7 +484,9 @@ async function createSignedUrls(
    TOKENIZATION
    ========================================================= */
 
-function tokenize(query: string): string[] {
+function tokenize(
+  query: string
+): string[] {
   return query
     .toLowerCase()
     .normalize("NFKC")
@@ -374,14 +504,27 @@ async function loadCurrentRelease(
   env: Env,
   signal?: AbortSignal
 ): Promise<CurrentRelease> {
-  const current = await fetchGzipJson(env, "current.json", SEARCH_TIMEOUT_MS, signal)
+  const current = await fetchGzipJson(
+    env,
+    "current.json",
+    SEARCH_TIMEOUT_MS,
+    signal
+  )
 
-  if (!current || typeof current !== "object") {
+  if (
+    !current ||
+    typeof current !== "object"
+  ) {
     throw new Error("Invalid current.json")
   }
 
-  if (typeof current.version !== "string" || typeof current.manifest !== "string") {
-    throw new Error("current.json is missing version or manifest")
+  if (
+    typeof current.version !== "string" ||
+    typeof current.manifest !== "string"
+  ) {
+    throw new Error(
+      "current.json is missing version or manifest"
+    )
   }
 
   return current as CurrentRelease
@@ -392,15 +535,32 @@ async function loadManifest(
   current: CurrentRelease,
   signal?: AbortSignal
 ): Promise<Manifest> {
-  const path = releasePath(current.version, current.manifest)
-  const manifest = await fetchGzipJson(env, path, SEARCH_TIMEOUT_MS, signal)
+  const path = releasePath(
+    current.version,
+    current.manifest
+  )
 
-  if (!manifest || typeof manifest !== "object") {
+  const manifest = await fetchGzipJson(
+    env,
+    path,
+    SEARCH_TIMEOUT_MS,
+    signal
+  )
+
+  if (
+    !manifest ||
+    typeof manifest !== "object"
+  ) {
     throw new Error("Invalid manifest")
   }
 
-  if (!Array.isArray(manifest.docs_shards) || !Array.isArray(manifest.term_shards)) {
-    throw new Error("Manifest is missing docs_shards or term_shards")
+  if (
+    !Array.isArray(manifest.docs_shards) ||
+    !Array.isArray(manifest.term_shards)
+  ) {
+    throw new Error(
+      "Manifest is missing docs_shards or term_shards"
+    )
   }
 
   return manifest as Manifest
@@ -410,40 +570,77 @@ async function loadManifest(
    TERM SHARDS
    ========================================================= */
 
-function normalizeTermShard(data: any): Map<string, TermEntry[]> {
+function normalizeTermShard(
+  data: any
+): Map<string, TermEntry[]> {
   const result = new Map<string, TermEntry[]>()
 
-  function add(term: string, entries: any[]): void {
-    result.set(
-      term.toLowerCase(),
-      entries
-        .filter(entry => entry && typeof entry === "object")
-        .map(entry => ({
-          ...entry,
-          id: String(entry.id),
-          tf: Number(entry.tf || 0),
-          title: entry.title !== undefined ? Number(entry.title) : 0
-        }))
-    )
-  }
-
-  if (data && typeof data === "object" && !Array.isArray(data)) {
+  if (
+    data &&
+    typeof data === "object" &&
+    !Array.isArray(data)
+  ) {
     for (const [term, entries] of Object.entries(data)) {
-      if (Array.isArray(entries)) add(term, entries)
+      if (!Array.isArray(entries)) {
+        continue
+      }
+
+      result.set(
+        term.toLowerCase(),
+        entries
+          .filter(
+            entry =>
+              entry &&
+              typeof entry === "object"
+          )
+          .map(entry => {
+            const value = entry as any
+
+            return {
+              ...value,
+              id: String(value.id),
+              tf: Number(value.tf || 0),
+              title:
+                value.title !== undefined
+                  ? Number(value.title)
+                  : 0
+            }
+          })
+      )
     }
+
     return result
   }
 
   if (Array.isArray(data)) {
     for (const item of data) {
       if (
-        item &&
-        typeof item === "object" &&
-        typeof item.term === "string" &&
-        Array.isArray(item.entries)
+        !item ||
+        typeof item !== "object" ||
+        typeof item.term !== "string" ||
+        !Array.isArray(item.entries)
       ) {
-        add(item.term, item.entries)
+        continue
       }
+
+      result.set(
+        item.term.toLowerCase(),
+        item.entries
+          .filter(
+            (entry: any) =>
+              entry &&
+              typeof entry === "object"
+          )
+          .map((entry: any) => ({
+            ...entry,
+            id: String(entry.id),
+            tf: Number(entry.tf || 0),
+            title:
+              entry.title !== undefined
+                ? Number(entry.title)
+                : 0
+          }))
+      )
     }
   }
 
@@ -457,31 +654,75 @@ async function getTermEntries(
   terms: string[],
   signal?: AbortSignal
 ): Promise<Map<string, TermEntry[]>> {
-  const wanted = new Set(terms.map(term => term.toLowerCase()))
+  const wanted = new Set(
+    terms.map(term => term.toLowerCase())
+  )
+
   const found = new Map<string, TermEntry[]>()
 
   const shardNames = manifest.term_shards.slice(
     0,
-    Math.min(manifest.term_shards.length, MAX_TERM_SHARDS_PER_SEARCH)
+    Math.min(
+      manifest.term_shards.length,
+      MAX_TERM_SHARDS_PER_SEARCH
+    )
   )
 
-  await mapConcurrent(shardNames, TERM_SHARD_CONCURRENCY, async shardName => {
-    if (signal?.aborted || found.size === wanted.size) return
-
-    try {
-      const path = releasePath(current.version, shardName)
-      const data = await fetchGzipJson(env, path, SEARCH_TIMEOUT_MS, signal)
-      const entries = normalizeTermShard(data)
-
-      for (const term of wanted) {
-        if (found.has(term)) continue
-        const value = entries.get(term)
-        if (value) found.set(term, value)
+  await mapConcurrent(
+    shardNames,
+    TERM_SHARD_CONCURRENCY,
+    async shardName => {
+      if (signal?.aborted) {
+        throw new Error("Search aborted")
       }
-    } catch {
-      // A failed shard should not prevent other shards from being searched.
+
+      if (found.size === wanted.size) {
+        return
+      }
+
+      try {
+        const path = releasePath(
+          current.version,
+          shardName
+        )
+
+        const data = await fetchGzipJson(
+          env,
+          path,
+          SEARCH_TIMEOUT_MS,
+          signal
+        )
+
+        const entries = normalizeTermShard(data)
+
+        for (const term of wanted) {
+          if (found.has(term)) {
+            continue
+          }
+
+          const value = entries.get(term)
+
+          if (value) {
+            found.set(term, value)
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          throw error
+        }
+
+        console.error(
+          `[search] Term shard failed: ${shardName}`,
+          error
+        )
+      }
     }
-  })
+  )
+
+  console.log(
+    `[search] Terms requested=${wanted.size}, found=${found.size}, ` +
+    `shards=${shardNames.length}`
+  )
 
   return found
 }
@@ -490,12 +731,17 @@ async function getTermEntries(
    DOCUMENT SHARDS
    ========================================================= */
 
-function normalizeDocuments(data: any): Document[] {
+function normalizeDocuments(
+  data: any
+): Document[] {
   let documents: any[] = []
 
   if (Array.isArray(data)) {
     documents = data
-  } else if (data && typeof data === "object") {
+  } else if (
+    data &&
+    typeof data === "object"
+  ) {
     if (Array.isArray(data.documents)) {
       documents = data.documents
     } else if (data.id !== undefined) {
@@ -504,7 +750,12 @@ function normalizeDocuments(data: any): Document[] {
   }
 
   return documents
-    .filter(item => item && typeof item === "object" && item.id !== undefined)
+    .filter(
+      item =>
+        item &&
+        typeof item === "object" &&
+        item.id !== undefined
+    )
     .map(item => ({
       ...item,
       id: Number(item.id),
@@ -513,7 +764,11 @@ function normalizeDocuments(data: any): Document[] {
       description: String(item.description || ""),
       text: String(item.text || "")
     }))
-    .filter(item => Number.isInteger(item.id) && item.url.length > 0) as Document[]
+    .filter(
+      item =>
+        Number.isInteger(item.id) &&
+        item.url.length > 0
+    ) as Document[]
 }
 
 async function getDocuments(
@@ -523,38 +778,96 @@ async function getDocuments(
   ids: number[],
   signal?: AbortSignal
 ): Promise<Document[]> {
-  if (ids.length === 0) return []
+  if (ids.length === 0) {
+    return []
+  }
 
-  const requestedIds = new Set(ids.slice(0, MAX_DOCUMENT_IDS))
-  const shardIds = [...requestedIds].map(id => Math.floor(id / 250))
-  const uniqueShardIds = [...new Set(shardIds)]
-  const limitedShardIds = uniqueShardIds.slice(0, MAX_DOCUMENT_SHARDS_PER_SEARCH)
+  const requestedIds = new Set(
+    ids.slice(0, MAX_DOCUMENT_IDS)
+  )
+
+  const shardIds = [...requestedIds].map(
+    id => Math.floor(id / 250)
+  )
+
+  const uniqueShardIds = [
+    ...new Set(shardIds)
+  ]
+
+  const limitedShardIds = uniqueShardIds.slice(
+    0,
+    MAX_DOCUMENT_SHARDS_PER_SEARCH
+  )
+
   const documents = new Map<number, Document>()
 
-  await mapConcurrent(limitedShardIds, DOCUMENT_SHARD_CONCURRENCY, async shardId => {
-    if (signal?.aborted || documents.size === requestedIds.size) return
-
-    const shardName = manifest.docs_shards[shardId]
-    if (!shardName) return
-
-    try {
-      const path = releasePath(current.version, shardName)
-      const data = await fetchGzipJson(env, path, SEARCH_TIMEOUT_MS, signal)
-      const shardDocuments = normalizeDocuments(data)
-
-      for (const document of shardDocuments) {
-        if (requestedIds.has(document.id)) {
-          documents.set(document.id, document)
-        }
+  await mapConcurrent(
+    limitedShardIds,
+    DOCUMENT_SHARD_CONCURRENCY,
+    async shardId => {
+      if (signal?.aborted) {
+        throw new Error("Search aborted")
       }
-    } catch {
-      // Missing or unavailable document shards are skipped.
-    }
-  })
 
-  return [...requestedIds]
+      if (documents.size === requestedIds.size) {
+        return
+      }
+
+      const shardName = manifest.docs_shards[shardId]
+
+      if (!shardName) {
+        console.error(
+          `[search] No document shard at index ${shardId}`
+        )
+        return
+      }
+
+      try {
+        const path = releasePath(
+          current.version,
+          shardName
+        )
+
+        const data = await fetchGzipJson(
+          env,
+          path,
+          SEARCH_TIMEOUT_MS,
+          signal
+        )
+
+        const shardDocuments = normalizeDocuments(data)
+
+        for (const document of shardDocuments) {
+          if (requestedIds.has(document.id)) {
+            documents.set(document.id, document)
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          throw error
+        }
+
+        console.error(
+          `[search] Document shard failed: ${shardName}`,
+          error
+        )
+      }
+    }
+  )
+
+  const output = [...requestedIds]
     .map(id => documents.get(id))
-    .filter((document): document is Document => Boolean(document))
+    .filter(
+      (document): document is Document =>
+        Boolean(document)
+    )
+
+  console.log(
+    `[search] Document IDs requested=${requestedIds.size}, ` +
+    `documents loaded=${output.length}`
+  )
+
+  return output
 }
 
 /* =========================================================
@@ -576,12 +889,24 @@ function truth25(
   let score = 0
 
   for (const term of terms) {
-    if (title.includes(term)) score += 25
-    if (description.includes(term)) score += 8
-    if (text.includes(term)) score += 3
-    if (url.includes(term)) score += 5
+    if (title.includes(term)) {
+      score += 25
+    }
+
+    if (description.includes(term)) {
+      score += 8
+    }
+
+    if (text.includes(term)) {
+      score += 3
+    }
+
+    if (url.includes(term)) {
+      score += 5
+    }
 
     const termEntries = entries.get(term)
+
     if (termEntries) {
       for (const entry of termEntries) {
         if (Number(entry.id) === document.id) {
@@ -593,8 +918,14 @@ function truth25(
     }
   }
 
-  if (title.includes(normalizedQuery)) score += 25
-  score += Math.min(5, document.text.length / 10000)
+  if (title.includes(normalizedQuery)) {
+    score += 25
+  }
+
+  score += Math.min(
+    5,
+    document.text.length / 10000
+  )
 
   return score
 }
@@ -604,11 +935,20 @@ function truth25(
    ========================================================= */
 
 function normalizeMedia(data: any): any[] {
-  if (Array.isArray(data)) return data
+  if (Array.isArray(data)) {
+    return data
+  }
 
   if (data && typeof data === "object") {
-    for (const key of ["items", "media", "images", "videos"]) {
-      if (Array.isArray(data[key])) return data[key]
+    for (const key of [
+      "items",
+      "media",
+      "images",
+      "videos"
+    ]) {
+      if (Array.isArray(data[key])) {
+        return data[key]
+      }
     }
   }
 
@@ -616,54 +956,111 @@ function normalizeMedia(data: any): any[] {
 }
 
 function normalizeUrl(value: unknown): string {
-  if (typeof value !== "string") return ""
+  if (typeof value !== "string") {
+    return ""
+  }
 
   try {
     const url = new URL(value)
+
     url.hash = ""
 
-    if (url.pathname.length > 1 && url.pathname.endsWith("/")) {
+    if (
+      url.pathname.length > 1 &&
+      url.pathname.endsWith("/")
+    ) {
       url.pathname = url.pathname.slice(0, -1)
     }
 
     return url.toString().toLowerCase()
   } catch {
-    return value.trim().replace(/#.*$/, "").replace(/\/+$/, "").toLowerCase()
+    return value
+      .trim()
+      .replace(/#.*$/, "")
+      .replace(/\/+$/, "")
+      .toLowerCase()
   }
 }
 
 function getMediaPageUrl(item: any): string {
   for (const key of [
-    "page_url", "source_url", "source", "document_url", "documentUrl",
-    "parent_url", "parentUrl", "origin_url", "originUrl", "page",
-    "source_page", "sourcePage"
+    "page_url",
+    "source_url",
+    "source",
+    "document_url",
+    "documentUrl",
+    "parent_url",
+    "parentUrl",
+    "origin_url",
+    "originUrl",
+    "page",
+    "source_page",
+    "sourcePage"
   ]) {
-    if (typeof item?.[key] === "string") return item[key]
+    if (typeof item?.[key] === "string") {
+      return item[key]
+    }
   }
 
   return ""
 }
 
-function mediaMatchesDocument(item: any, documentUrl: string): boolean {
+function mediaMatchesDocument(
+  item: any,
+  documentUrl: string
+): boolean {
   const target = normalizeUrl(documentUrl)
-  const mediaPage = normalizeUrl(getMediaPageUrl(item))
 
-  if (mediaPage && mediaPage === target) return true
+  const mediaPage = normalizeUrl(
+    getMediaPageUrl(item)
+  )
+
+  if (mediaPage && mediaPage === target) {
+    return true
+  }
 
   const mediaUrl = normalizeUrl(item?.url)
-  return Boolean(mediaUrl && mediaUrl === target)
+
+  if (mediaUrl && mediaUrl === target) {
+    return true
+  }
+
+  return false
 }
 
 function compactMedia(item: any): MediaItem {
   const result: MediaItem = {}
 
-  for (const key of [
-    "url", "path", "title", "alt", "type", "mime_type",
-    "thumbnail", "thumbnail_path"
-  ] as const) {
-    if (typeof item?.[key] === "string") {
-      result[key] = item[key]
-    }
+  if (typeof item.url === "string") {
+    result.url = item.url
+  }
+
+  if (typeof item.path === "string") {
+    result.path = item.path
+  }
+
+  if (typeof item.title === "string") {
+    result.title = item.title
+  }
+
+  if (typeof item.alt === "string") {
+    result.alt = item.alt
+  }
+
+  if (typeof item.type === "string") {
+    result.type = item.type
+  }
+
+  if (typeof item.mime_type === "string") {
+    result.mime_type = item.mime_type
+  }
+
+  if (typeof item.thumbnail === "string") {
+    result.thumbnail = item.thumbnail
+  }
+
+  if (typeof item.thumbnail_path === "string") {
+    result.thumbnail_path = item.thumbnail_path
   }
 
   return result
@@ -686,8 +1083,18 @@ async function loadMediaFile(
       MEDIA_TIMEOUT_MS,
       signal
     )
+
     return normalizeMedia(data)
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) {
+      throw error
+    }
+
+    console.error(
+      `[media] Media manifest failed: ${path}`,
+      error
+    )
+
     return []
   }
 }
@@ -698,12 +1105,20 @@ async function loadMediaCollection(
   path?: string,
   signal?: AbortSignal
 ): Promise<any[]> {
-  if (!path) return []
-  return loadMediaFile(env, current, path, signal)
+  if (!path) {
+    return []
+  }
+
+  return loadMediaFile(
+    env,
+    current,
+    path,
+    signal
+  )
 }
 
 /* =========================================================
-   ATTACH MEDIA TO SEARCH RESULTS
+   ATTACH MEDIA
    ========================================================= */
 
 async function attachMedia(
@@ -713,11 +1128,23 @@ async function attachMedia(
   results: SearchResult[],
   signal?: AbortSignal
 ): Promise<void> {
-  if (results.length === 0) return
+  if (results.length === 0) {
+    return
+  }
 
   const [images, videos] = await Promise.all([
-    loadMediaCollection(env, current, manifest.images, signal),
-    loadMediaCollection(env, current, manifest.videos, signal)
+    loadMediaCollection(
+      env,
+      current,
+      manifest.images,
+      signal
+    ),
+    loadMediaCollection(
+      env,
+      current,
+      manifest.videos,
+      signal
+    )
   ])
 
   const imagePaths: string[] = []
@@ -725,43 +1152,76 @@ async function attachMedia(
 
   for (const result of results) {
     const matchedImages = images
-      .filter(image => mediaMatchesDocument(image, result.url))
+      .filter(image =>
+        mediaMatchesDocument(image, result.url)
+      )
       .slice(0, MAX_IMAGES_PER_RESULT)
 
     const matchedVideos = videos
-      .filter(video => mediaMatchesDocument(video, result.url))
+      .filter(video =>
+        mediaMatchesDocument(video, result.url)
+      )
       .slice(0, MAX_VIDEOS_PER_RESULT)
 
     result.images = matchedImages.map(compactMedia)
     result.videos = matchedVideos.map(compactMedia)
 
     for (const image of result.images) {
-      if (image.path) imagePaths.push(image.path)
+      if (image.path) {
+        imagePaths.push(image.path)
+      }
     }
 
     for (const video of result.videos) {
-      if (video.thumbnail_path) videoThumbnailPaths.push(video.thumbnail_path)
+      if (video.thumbnail_path) {
+        videoThumbnailPaths.push(video.thumbnail_path)
+      }
     }
   }
 
-  const uniqueImagePaths = [...new Set(imagePaths)].slice(0, MAX_IMAGE_SIGNED_URLS)
-  const uniqueVideoPaths = [...new Set(videoThumbnailPaths)].slice(0, MAX_VIDEO_SIGNED_URLS)
+  const uniqueImagePaths = [
+    ...new Set(imagePaths)
+  ].slice(0, MAX_IMAGE_SIGNED_URLS)
 
-  const [imageSignedUrls, videoSignedUrls] = await Promise.all([
-    createSignedUrls(env, "images", uniqueImagePaths, signal),
-    createSignedUrls(env, "videos", uniqueVideoPaths, signal)
+  const uniqueVideoPaths = [
+    ...new Set(videoThumbnailPaths)
+  ].slice(0, MAX_VIDEO_SIGNED_URLS)
+
+  const [
+    imageSignedUrls,
+    videoSignedUrls
+  ] = await Promise.all([
+    createSignedUrls(
+      env,
+      "images",
+      uniqueImagePaths,
+      signal
+    ),
+    createSignedUrls(
+      env,
+      "videos",
+      uniqueVideoPaths,
+      signal
+    )
   ])
 
   for (const result of results) {
     for (const image of result.images) {
-      if (image.path && imageSignedUrls.has(image.path)) {
+      if (
+        image.path &&
+        imageSignedUrls.has(image.path)
+      ) {
         image.url = imageSignedUrls.get(image.path)
       }
     }
 
     for (const video of result.videos) {
-      if (video.thumbnail_path && videoSignedUrls.has(video.thumbnail_path)) {
-        video.thumbnail = videoSignedUrls.get(video.thumbnail_path)
+      if (
+        video.thumbnail_path &&
+        videoSignedUrls.has(video.thumbnail_path)
+      ) {
+        video.thumbnail =
+          videoSignedUrls.get(video.thumbnail_path)
       }
     }
   }
@@ -779,10 +1239,21 @@ async function performSearch(
   signal?: AbortSignal
 ): Promise<SearchResult[]> {
   const terms = tokenize(query)
-  if (terms.length === 0) return []
 
-  const current = await loadCurrentRelease(env, signal)
-  const manifest = await loadManifest(env, current, signal)
+  if (terms.length === 0) {
+    return []
+  }
+
+  const current = await loadCurrentRelease(
+    env,
+    signal
+  )
+
+  const manifest = await loadManifest(
+    env,
+    current,
+    signal
+  )
 
   const termEntries = await getTermEntries(
     env,
@@ -792,23 +1263,41 @@ async function performSearch(
     signal
   )
 
-  if (termEntries.size === 0) return []
+  if (termEntries.size === 0) {
+    console.warn(
+      `[search] No matching term entries for query: ${query}`
+    )
+    return []
+  }
 
   const documentIds = new Set<number>()
 
   for (const entries of termEntries.values()) {
     for (const entry of entries) {
       const id = Number(entry.id)
-      if (!Number.isInteger(id) || id < 0) continue
+
+      if (!Number.isInteger(id) || id < 0) {
+        continue
+      }
 
       documentIds.add(id)
-      if (documentIds.size >= MAX_DOCUMENT_IDS) break
+
+      if (documentIds.size >= MAX_DOCUMENT_IDS) {
+        break
+      }
     }
 
-    if (documentIds.size >= MAX_DOCUMENT_IDS) break
+    if (documentIds.size >= MAX_DOCUMENT_IDS) {
+      break
+    }
   }
 
-  if (documentIds.size === 0) return []
+  if (documentIds.size === 0) {
+    console.warn(
+      `[search] No document IDs for query: ${query}`
+    )
+    return []
+  }
 
   const documents = await getDocuments(
     env,
@@ -821,13 +1310,28 @@ async function performSearch(
   const scored = documents
     .map(document => ({
       document,
-      score: truth25(document, query, terms, termEntries)
+      score: truth25(
+        document,
+        query,
+        terms,
+        termEntries
+      )
     }))
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score)
 
+  console.log(
+    `[search] Query="${query}", terms=${terms.length}, ` +
+    `termEntries=${termEntries.size}, candidateIDs=${documentIds.size}, ` +
+    `documents=${documents.length}, scored=${scored.length}`
+  )
+
   const offset = (page - 1) * limit
-  const selected = scored.slice(offset, offset + limit)
+
+  const selected = scored.slice(
+    offset,
+    offset + limit
+  )
 
   const results: SearchResult[] = selected.map(item => ({
     id: item.document.id,
@@ -840,7 +1344,13 @@ async function performSearch(
   }))
 
   if (results.length > 0) {
-    await attachMedia(env, manifest, current, results, signal)
+    await attachMedia(
+      env,
+      manifest,
+      current,
+      results,
+      signal
+    )
   }
 
   return results
@@ -850,15 +1360,23 @@ async function performSearch(
    REQUEST HANDLER
    ========================================================= */
 
-async function handleRequest(request: Request): Promise<Response> {
+async function handleRequest(
+  request: Request
+): Promise<Response> {
   const url = new URL(request.url)
 
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS })
+    return new Response(null, {
+      status: 204,
+      headers: CORS_HEADERS
+    })
   }
 
   if (request.method !== "GET") {
-    return jsonResponse({ error: "Method not allowed" }, 405)
+    return jsonResponse(
+      { error: "Method not allowed" },
+      405
+    )
   }
 
   if (url.pathname === "/health") {
@@ -871,27 +1389,46 @@ async function handleRequest(request: Request): Promise<Response> {
   }
 
   if (url.pathname !== "/search") {
-    return jsonResponse({ error: "Not found" }, 404)
+    return jsonResponse(
+      { error: "Not found" },
+      404
+    )
   }
 
-  const query = url.searchParams.get("q")?.trim() || ""
+  const query =
+    url.searchParams.get("q")?.trim() || ""
+
   if (!query) {
-    return jsonResponse({ error: "Missing query parameter" }, 400)
+    return jsonResponse(
+      { error: "Missing query parameter" },
+      400
+    )
   }
 
-  const requestedPage = Number(url.searchParams.get("page") || 1)
-  const requestedLimit = Number(url.searchParams.get("limit") || DEFAULT_SEARCH_LIMIT)
+  const requestedPage = Number(
+    url.searchParams.get("page") || 1
+  )
+
+  const requestedLimit = Number(
+    url.searchParams.get("limit") || 20
+  )
 
   const page = Number.isFinite(requestedPage)
     ? Math.min(1000, Math.max(1, Math.floor(requestedPage)))
     : 1
 
   const limit = Number.isFinite(requestedLimit)
-    ? Math.min(MAX_SEARCH_RESULTS, Math.max(1, Math.floor(requestedLimit)))
-    : DEFAULT_SEARCH_LIMIT
+    ? Math.min(
+        MAX_SEARCH_RESULTS,
+        Math.max(1, Math.floor(requestedLimit))
+      )
+    : 20
 
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS)
+
+  const timeout = setTimeout(() => {
+    controller.abort()
+  }, SEARCH_TIMEOUT_MS)
 
   try {
     const results = await performSearch(
@@ -902,17 +1439,36 @@ async function handleRequest(request: Request): Promise<Response> {
       controller.signal
     )
 
-    return jsonResponse({ query, results })
+    if (controller.signal.aborted) {
+      return jsonResponse(
+        { error: "Search request timed out" },
+        504
+      )
+    }
+
+    return jsonResponse({
+      query,
+      results
+    })
   } catch (error) {
     console.error("[search]", error)
 
     if (controller.signal.aborted) {
-      return jsonResponse({ error: "Search request timed out" }, 504)
+      return jsonResponse(
+        { error: "Search request timed out" },
+        504
+      )
     }
 
-    return jsonResponse({
-      error: error instanceof Error ? error.message : "Search failed"
-    }, 500)
+    return jsonResponse(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Search failed"
+      },
+      500
+    )
   } finally {
     clearTimeout(timeout)
   }
@@ -926,17 +1482,30 @@ async function nodeRequestToWebRequest(
   request: http.IncomingMessage
 ): Promise<Request> {
   const protocol = (
-    request.headers["x-forwarded-proto"] || "http"
-  ).toString().split(",")[0].trim()
+    request.headers["x-forwarded-proto"] ||
+    "http"
+  )
+    .toString()
+    .split(",")[0]
+    .trim()
 
-  const host = (request.headers.host || "localhost").toString()
-  const url = `${protocol}://${host}${request.url || "/"}`
+  const host = (
+    request.headers.host ||
+    "localhost"
+  ).toString()
+
+  const url =
+    `${protocol}://${host}${request.url || "/"}`
 
   const headers = new Headers()
 
-  for (const [key, value] of Object.entries(request.headers)) {
+  for (const [key, value] of Object.entries(
+    request.headers
+  )) {
     if (Array.isArray(value)) {
-      for (const item of value) headers.append(key, item)
+      for (const item of value) {
+        headers.append(key, item)
+      }
     } else if (value !== undefined) {
       headers.set(key, value)
     }
@@ -959,6 +1528,7 @@ async function sendResponse(
   })
 
   const body = await webResponse.arrayBuffer()
+
   response.end(Buffer.from(body))
 }
 
@@ -966,47 +1536,77 @@ async function sendResponse(
    SERVER
    ========================================================= */
 
-const port = Number(process.env.PORT || 10000)
+const port = Number(
+  process.env.PORT || 10000
+)
 
-const server = http.createServer(async (nodeRequest, nodeResponse) => {
-  const started = Date.now()
+const server = http.createServer(
+  async (nodeRequest, nodeResponse) => {
+    const started = Date.now()
 
-  try {
-    const request = await nodeRequestToWebRequest(nodeRequest)
-    const response = await handleRequest(request)
+    try {
+      const request = await nodeRequestToWebRequest(
+        nodeRequest
+      )
 
-    await sendResponse(nodeResponse, response)
+      const response = await handleRequest(request)
 
-    const url = new URL(request.url)
-    console.log(
-      `[request] ${request.method} ${url.pathname}${url.search} ` +
-      `${response.status} ${Date.now() - started}ms`
-    )
-  } catch (error) {
-    console.error("[server]", error)
+      await sendResponse(
+        nodeResponse,
+        response
+      )
 
-    if (!nodeResponse.headersSent) {
-      const response = jsonResponse({
-        error: error instanceof Error ? error.message : "Internal server error"
-      }, 500)
+      const url = new URL(request.url)
 
-      await sendResponse(nodeResponse, response)
-    } else {
-      nodeResponse.end()
+      console.log(
+        `[request] ${request.method} ` +
+        `${url.pathname}${url.search} ` +
+        `${response.status} ` +
+        `${Date.now() - started}ms`
+      )
+    } catch (error) {
+      console.error("[server]", error)
+
+      if (!nodeResponse.headersSent) {
+        const response = jsonResponse(
+          {
+            error:
+              error instanceof Error
+                ? error.message
+                : "Internal server error"
+          },
+          500
+        )
+
+        await sendResponse(
+          nodeResponse,
+          response
+        )
+      } else {
+        nodeResponse.end()
+      }
     }
   }
-})
+)
 
-server.listen(port, "0.0.0.0", () => {
-  console.log(`Seendex Remade API listening on port ${port}`)
-})
+server.listen(
+  port,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Seendex Remade API listening on port ${port}`
+    )
+  }
+)
 
 /* =========================================================
    SHUTDOWN
    ========================================================= */
 
 function shutdown(signal: string): void {
-  console.log(`[server] received ${signal}, shutting down`)
+  console.log(
+    `[server] received ${signal}, shutting down`
+  )
 
   server.close(() => {
     process.exit(0)
