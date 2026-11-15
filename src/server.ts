@@ -400,9 +400,14 @@ async function createSignedUrls(
   paths: string[],
   signal?: AbortSignal
 ): Promise<Map<string, string>> {
-  const uniquePaths = [
-    ...new Set(paths.filter(Boolean))
-  ]
+  const uniquePaths: string[] = [
+  ...new Set<string>(
+    paths.filter(
+      (path): path is string =>
+        typeof path === "string" && path.length > 0
+    )
+  )
+]
 
   if (uniquePaths.length === 0) {
     return new Map()
