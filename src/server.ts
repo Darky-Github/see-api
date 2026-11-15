@@ -1,17 +1,14 @@
-
 import http from "node:http"
 import { gunzip } from "node:zlib"
 import { promisify } from "node:util"
 
 const gunzipAsync = promisify(gunzip)
 
-/* =========================================================
-   TYPES
-   ========================================================= */
-
 interface Env {
   SUPABASE_URL: string
   SUPABASE_SECRET_KEY: string
+  DECISIONRANK_URL: string
+  DECISIONRANK_API_KEY: string
 }
 
 interface Manifest {
@@ -63,16 +60,34 @@ interface SearchResult {
   url: string
   title: string
   description: string
-  score: number
   images: MediaItem[]
   videos: MediaItem[]
 }
 
-/* =========================================================
-   CONFIGURATION
-   ========================================================= */
+interface DecisionCandidate {
+  id: string
+  url: string
+  title: string
+  description: string
+  text: string
+  images: MediaItem[]
+  videos: MediaItem[]
+}
+
+interface DecisionRankResponse {
+  decision: "allow" | "block"
+  reason_code: string | null
+  approved_ids: string[]
+}
+
+interface SearchOutput {
+  decision: "allow" | "block"
+  reason_code: string | null
+  results: SearchResult[]
+}
 
 const MAX_DOCUMENT_IDS = 1000
+const MAX_RANK_CANDIDATES = 200
 const MAX_SEARCH_RESULTS = 25
 
 const MAX_IMAGES_PER_RESULT = 4
@@ -80,6 +95,8 @@ const MAX_VIDEOS_PER_RESULT = 2
 
 const MAX_IMAGE_SIGNED_URLS = 100
 const MAX_VIDEO_SIGNED_URLS = 100
+
+const MAX_RANK_TEXT_LENGTH = 4000
 
 const SIGNED_URL_EXPIRES = 3600
 
@@ -92,6 +109,7 @@ const SIGNED_URL_CONCURRENCY = 12
 
 const SEARCH_TIMEOUT_MS = 15000
 const MEDIA_TIMEOUT_MS = 5000
+const DECISIONRANK_TIMEOUT_MS = 12000
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -100,16 +118,21 @@ const CORS_HEADERS = {
   "Access-Control-Max-Age": "86400"
 }
 
-/* =========================================================
-   ENVIRONMENT
-   ========================================================= */
-
 function loadEnv(): Env {
   const SUPABASE_URL =
     process.env.SUPABASE_URL?.trim()
 
   const SUPABASE_SECRET_KEY =
     process.env.SUPABASE_SECRET_KEY?.trim()
+
+  const DECISIONRANK_URL =
+    (
+      process.env.DECISIONRANK_URL ||
+      "https://decisionrank.onrender.com"
+    ).trim().replace(/\/+$/, "")
+
+  const DECISIONRANK_API_KEY =
+    process.env.DECISIONRANK_API_KEY?.trim() || ""
 
   if (!SUPABASE_URL) {
     throw new Error(
@@ -123,17 +146,29 @@ function loadEnv(): Env {
     )
   }
 
+  try {
+    const parsed = new URL(DECISIONRANK_URL)
+
+    if (
+      parsed.protocol !== "https:" &&
+      parsed.hostname !== "localhost" &&
+      parsed.hostname !== "127.0.0.1"
+    ) {
+      throw new Error("DecisionRank must use HTTPS")
+    }
+  } catch {
+    throw new Error("Invalid DECISIONRANK_URL")
+  }
+
   return {
     SUPABASE_URL: SUPABASE_URL.replace(/\/+$/, ""),
-    SUPABASE_SECRET_KEY
+    SUPABASE_SECRET_KEY,
+    DECISIONRANK_URL,
+    DECISIONRANK_API_KEY
   }
 }
 
 const env = loadEnv()
-
-/* =========================================================
-   REQUEST HELPERS
-   ========================================================= */
 
 function timeoutSignal(
   timeoutMs: number,
@@ -165,10 +200,6 @@ async function fetchWithTimeout(
   })
 }
 
-/* =========================================================
-   CORS / RESPONSES
-   ========================================================= */
-
 function jsonResponse(
   data: unknown,
   status = 200
@@ -179,16 +210,12 @@ function jsonResponse(
       status,
       headers: {
         ...CORS_HEADERS,
-        "Content-Type":
-          "application/json; charset=utf-8"
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store"
       }
     }
   )
 }
-
-/* =========================================================
-   SUPABASE STORAGE
-   ========================================================= */
 
 function storageUrl(
   env: Env,
@@ -211,10 +238,6 @@ function supabaseHeaders(
       env.SUPABASE_SECRET_KEY
   }
 }
-
-/* =========================================================
-   GZIP / JSON STORAGE
-   ========================================================= */
 
 async function fetchGzipText(
   env: Env,
@@ -326,10 +349,6 @@ function releasePath(
   return `${version}/${path}`
 }
 
-/* =========================================================
-   GENERIC CONCURRENCY
-   ========================================================= */
-
 async function mapConcurrent<T, R>(
   items: T[],
   concurrency: number,
@@ -374,10 +393,6 @@ async function mapConcurrent<T, R>(
 
   return results
 }
-
-/* =========================================================
-   SIGNED MEDIA URLS
-   ========================================================= */
 
 async function createSignedUrls(
   env: Env,
@@ -436,6 +451,7 @@ async function createSignedUrls(
             `[media] Signed URL request failed: ` +
             `${response.status} for bucket ${bucket}`
           )
+
           return []
         }
 
@@ -480,10 +496,6 @@ async function createSignedUrls(
   return output
 }
 
-/* =========================================================
-   TOKENIZATION
-   ========================================================= */
-
 function tokenize(
   query: string
 ): string[] {
@@ -495,10 +507,6 @@ function tokenize(
     .split(/\s+/)
     .filter(Boolean)
 }
-
-/* =========================================================
-   RELEASE / MANIFEST
-   ========================================================= */
 
 async function loadCurrentRelease(
   env: Env,
@@ -565,10 +573,6 @@ async function loadManifest(
 
   return manifest as Manifest
 }
-
-/* =========================================================
-   TERM SHARDS
-   ========================================================= */
 
 function normalizeTermShard(
   data: any
@@ -727,10 +731,6 @@ async function getTermEntries(
   return found
 }
 
-/* =========================================================
-   DOCUMENT SHARDS
-   ========================================================= */
-
 function normalizeDocuments(
   data: any
 ): Document[] {
@@ -819,6 +819,7 @@ async function getDocuments(
         console.error(
           `[search] No document shard at index ${shardId}`
         )
+
         return
       }
 
@@ -869,70 +870,6 @@ async function getDocuments(
 
   return output
 }
-
-/* =========================================================
-   TRUTH25 RANKING
-   ========================================================= */
-
-function truth25(
-  document: Document,
-  query: string,
-  terms: string[],
-  entries: Map<string, TermEntry[]>
-): number {
-  const title = document.title.toLowerCase()
-  const description = document.description.toLowerCase()
-  const text = document.text.toLowerCase()
-  const url = document.url.toLowerCase()
-  const normalizedQuery = query.toLowerCase()
-
-  let score = 0
-
-  for (const term of terms) {
-    if (title.includes(term)) {
-      score += 25
-    }
-
-    if (description.includes(term)) {
-      score += 8
-    }
-
-    if (text.includes(term)) {
-      score += 3
-    }
-
-    if (url.includes(term)) {
-      score += 5
-    }
-
-    const termEntries = entries.get(term)
-
-    if (termEntries) {
-      for (const entry of termEntries) {
-        if (Number(entry.id) === document.id) {
-          score += Number(entry.tf || 0) * 2
-          score += Number(entry.title || 0) * 8
-          break
-        }
-      }
-    }
-  }
-
-  if (title.includes(normalizedQuery)) {
-    score += 25
-  }
-
-  score += Math.min(
-    5,
-    document.text.length / 10000
-  )
-
-  return score
-}
-
-/* =========================================================
-   MEDIA HELPERS
-   ========================================================= */
 
 function normalizeMedia(data: any): any[] {
   if (Array.isArray(data)) {
@@ -1066,10 +1003,6 @@ function compactMedia(item: any): MediaItem {
   return result
 }
 
-/* =========================================================
-   MEDIA MANIFEST LOADING
-   ========================================================= */
-
 async function loadMediaFile(
   env: Env,
   current: CurrentRelease,
@@ -1116,10 +1049,6 @@ async function loadMediaCollection(
     signal
   )
 }
-
-/* =========================================================
-   ATTACH MEDIA
-   ========================================================= */
 
 async function attachMedia(
   env: Env,
@@ -1227,21 +1156,185 @@ async function attachMedia(
   }
 }
 
-/* =========================================================
-   SEARCH
-   ========================================================= */
+async function callDecisionRank(
+  query: string,
+  safe: "strict" | "moderate",
+  documents: Document[],
+  results: SearchResult[],
+  signal?: AbortSignal
+): Promise<DecisionRankResponse> {
+  if (!env.DECISIONRANK_API_KEY) {
+    throw new Error(
+      "DecisionRank API key is not configured"
+    )
+  }
+
+  const resultById = new Map(
+    results.map(result => [
+      String(result.id),
+      result
+    ])
+  )
+
+  const documentById = new Map(
+    documents.map(document => [
+      String(document.id),
+      document
+    ])
+  )
+
+  const candidateIds = results
+    .slice(0, MAX_RANK_CANDIDATES)
+    .map(result => String(result.id))
+
+  const candidates: DecisionCandidate[] =
+    candidateIds.map(id => {
+      const result = resultById.get(id)!
+      const document = documentById.get(id)
+
+      return {
+        id,
+        url: result.url,
+        title: result.title,
+        description: result.description,
+        text: (document?.text || "").slice(
+          0,
+          MAX_RANK_TEXT_LENGTH
+        ),
+        images: result.images,
+        videos: result.videos
+      }
+    })
+
+  const endpoint =
+    `${env.DECISIONRANK_URL}/rank`
+
+  let response: Response
+
+  try {
+    response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization":
+            `Bearer ${env.DECISIONRANK_API_KEY}`
+        },
+        body: JSON.stringify({
+          query,
+          safe,
+          candidates
+        }),
+        signal
+      },
+      DECISIONRANK_TIMEOUT_MS
+    )
+  } catch (error) {
+    console.error(
+      "[DecisionRank] Connection failed:",
+      error
+    )
+
+    throw new Error(
+      "DecisionRank is unavailable"
+    )
+  }
+
+  if (!response.ok) {
+    const body = await response.text()
+
+    console.error(
+      `[DecisionRank] HTTP ${response.status}: ` +
+      body.slice(0, 500)
+    )
+
+    throw new Error(
+      response.status === 503
+        ? "DecisionRank engine is not ready"
+        : "DecisionRank request failed"
+    )
+  }
+
+  let data: any
+
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error(
+      "DecisionRank returned invalid JSON"
+    )
+  }
+
+  if (
+    !data ||
+    (
+      data.decision !== "allow" &&
+      data.decision !== "block"
+    )
+  ) {
+    throw new Error(
+      "DecisionRank returned an invalid decision"
+    )
+  }
+
+  if (data.decision === "block") {
+    return {
+      decision: "block",
+      reason_code:
+        typeof data.reason_code === "string"
+          ? data.reason_code
+          : "search_blocked",
+      approved_ids: []
+    }
+  }
+
+  if (!Array.isArray(data.approved_ids)) {
+    throw new Error(
+      "DecisionRank response is missing approved_ids"
+    )
+  }
+
+  const allowedIds = new Set(candidateIds)
+
+  const approvedIds = data.approved_ids
+    .filter(
+      (id: unknown): id is string =>
+        typeof id === "string" &&
+        allowedIds.has(id)
+    )
+
+  return {
+    decision: "allow",
+    reason_code: null,
+    approved_ids: [...new Set(approvedIds)]
+  }
+}
 
 async function performSearch(
   env: Env,
   query: string,
+  safe: "strict" | "moderate",
   page: number,
   limit: number,
   signal?: AbortSignal
-): Promise<SearchResult[]> {
+): Promise<SearchOutput> {
   const terms = tokenize(query)
 
   if (terms.length === 0) {
-    return []
+    const decision = await callDecisionRank(
+      query,
+      safe,
+      [],
+      [],
+      signal
+    )
+
+    return {
+      decision: decision.decision,
+      reason_code: decision.reason_code,
+      results: []
+    }
   }
 
   const current = await loadCurrentRelease(
@@ -1262,13 +1355,6 @@ async function performSearch(
     terms,
     signal
   )
-
-  if (termEntries.size === 0) {
-    console.warn(
-      `[search] No matching term entries for query: ${query}`
-    )
-    return []
-  }
 
   const documentIds = new Set<number>()
 
@@ -1292,13 +1378,6 @@ async function performSearch(
     }
   }
 
-  if (documentIds.size === 0) {
-    console.warn(
-      `[search] No document IDs for query: ${query}`
-    )
-    return []
-  }
-
   const documents = await getDocuments(
     env,
     manifest,
@@ -1307,41 +1386,21 @@ async function performSearch(
     signal
   )
 
-  const scored = documents
-    .map(document => ({
-      document,
-      score: truth25(
-        document,
-        query,
-        terms,
-        termEntries
-      )
-    }))
-    .filter(item => item.score > 0)
-    .sort((a, b) => b.score - a.score)
-
-  console.log(
-    `[search] Query="${query}", terms=${terms.length}, ` +
-    `termEntries=${termEntries.size}, candidateIDs=${documentIds.size}, ` +
-    `documents=${documents.length}, scored=${scored.length}`
+  const candidates = documents.slice(
+    0,
+    MAX_RANK_CANDIDATES
   )
 
-  const offset = (page - 1) * limit
-
-  const selected = scored.slice(
-    offset,
-    offset + limit
+  const results: SearchResult[] = candidates.map(
+    document => ({
+      id: document.id,
+      url: document.url,
+      title: document.title,
+      description: document.description,
+      images: [],
+      videos: []
+    })
   )
-
-  const results: SearchResult[] = selected.map(item => ({
-    id: item.document.id,
-    url: item.document.url,
-    title: item.document.title,
-    description: item.document.description,
-    score: item.score,
-    images: [],
-    videos: []
-  }))
 
   if (results.length > 0) {
     await attachMedia(
@@ -1353,12 +1412,56 @@ async function performSearch(
     )
   }
 
-  return results
-}
+  console.log(
+    `[search] Query="${query}", ` +
+    `terms=${terms.length}, ` +
+    `termEntries=${termEntries.size}, ` +
+    `candidateIDs=${documentIds.size}, ` +
+    `loaded=${documents.length}, ` +
+    `sentToDecisionRank=${results.length}`
+  )
 
-/* =========================================================
-   REQUEST HANDLER
-   ========================================================= */
+  const decision = await callDecisionRank(
+    query,
+    safe,
+    candidates,
+    results,
+    signal
+  )
+
+  if (decision.decision === "block") {
+    return {
+      decision: "block",
+      reason_code: decision.reason_code,
+      results: []
+    }
+  }
+
+  const resultMap = new Map(
+    results.map(result => [
+      String(result.id),
+      result
+    ])
+  )
+
+  const orderedResults = decision.approved_ids
+    .map(id => resultMap.get(id))
+    .filter(
+      (result): result is SearchResult =>
+        Boolean(result)
+    )
+
+  const offset = (page - 1) * limit
+
+  return {
+    decision: "allow",
+    reason_code: null,
+    results: orderedResults.slice(
+      offset,
+      offset + limit
+    )
+  }
+}
 
 async function handleRequest(
   request: Request
@@ -1384,7 +1487,12 @@ async function handleRequest(
       ok: true,
       service: "seerchsqapi",
       runtime: "render",
-      uptime: process.uptime()
+      uptime: process.uptime(),
+      ranking_service: "DecisionRank",
+      ranking_service_url: env.DECISIONRANK_URL,
+      ranking_configured: Boolean(
+        env.DECISIONRANK_API_KEY
+      )
     })
   }
 
@@ -1405,6 +1513,25 @@ async function handleRequest(
     )
   }
 
+  const requestedSafe =
+    url.searchParams.get("safe") || "strict"
+
+  if (
+    requestedSafe !== "strict" &&
+    requestedSafe !== "moderate"
+  ) {
+    return jsonResponse(
+      {
+        error: "Invalid safe parameter",
+        allowed: ["strict", "moderate"]
+      },
+      400
+    )
+  }
+
+  const safe = requestedSafe as
+    "strict" | "moderate"
+
   const requestedPage = Number(
     url.searchParams.get("page") || 1
   )
@@ -1414,7 +1541,10 @@ async function handleRequest(
   )
 
   const page = Number.isFinite(requestedPage)
-    ? Math.min(1000, Math.max(1, Math.floor(requestedPage)))
+    ? Math.min(
+        1000,
+        Math.max(1, Math.floor(requestedPage))
+      )
     : 1
 
   const limit = Number.isFinite(requestedLimit)
@@ -1428,12 +1558,13 @@ async function handleRequest(
 
   const timeout = setTimeout(() => {
     controller.abort()
-  }, SEARCH_TIMEOUT_MS)
+  }, SEARCH_TIMEOUT_MS + DECISIONRANK_TIMEOUT_MS + 5000)
 
   try {
-    const results = await performSearch(
+    const output = await performSearch(
       env,
       query,
+      safe,
       page,
       limit,
       controller.signal
@@ -1448,7 +1579,10 @@ async function handleRequest(
 
     return jsonResponse({
       query,
-      results
+      safe,
+      decision: output.decision,
+      reason_code: output.reason_code,
+      results: output.results
     })
   } catch (error) {
     console.error("[search]", error)
@@ -1460,23 +1594,31 @@ async function handleRequest(
       )
     }
 
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Search failed"
+
+    if (
+      message.includes("DecisionRank")
+    ) {
+      return jsonResponse(
+        {
+          error: "DecisionRank unavailable",
+          message
+        },
+        503
+      )
+    }
+
     return jsonResponse(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Search failed"
-      },
+      { error: message },
       500
     )
   } finally {
     clearTimeout(timeout)
   }
 }
-
-/* =========================================================
-   NODE ADAPTER
-   ========================================================= */
 
 async function nodeRequestToWebRequest(
   request: http.IncomingMessage
@@ -1531,10 +1673,6 @@ async function sendResponse(
 
   response.end(Buffer.from(body))
 }
-
-/* =========================================================
-   SERVER
-   ========================================================= */
 
 const port = Number(
   process.env.PORT || 10000
@@ -1594,14 +1732,14 @@ server.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `Seendex Remade API listening on port ${port}`
+      `SEErch² Search API listening on port ${port}`
+    )
+
+    console.log(
+      `DecisionRank endpoint: ${env.DECISIONRANK_URL}/rank`
     )
   }
 )
-
-/* =========================================================
-   SHUTDOWN
-   ========================================================= */
 
 function shutdown(signal: string): void {
   console.log(
