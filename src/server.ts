@@ -1302,18 +1302,23 @@ async function callDecisionRank(
 
   const allowedIds = new Set(candidateIds)
 
-  const approvedIds = data.approved_ids
-    .filter(
-      (id: unknown): id is string =>
-        typeof id === "string" &&
-        allowedIds.has(id)
-    )
+  const approvedIds: string[] = []
 
-  return {
-    decision: "allow",
-    reason_code: null,
-    approved_ids: [...new Set(approvedIds)]
+for (const id of data.approved_ids as unknown[]) {
+  if (
+    typeof id === "string" &&
+    allowedIds.has(id) &&
+    !approvedIds.includes(id)
+  ) {
+    approvedIds.push(id)
   }
+}
+
+return {
+  decision: "allow",
+  reason_code: null,
+  approved_ids: approvedIds
+}
 }
 
 async function performSearch(
